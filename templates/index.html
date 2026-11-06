@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Görsel Yakalayıcı & Forum İndirici</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Üst Arama ve Kontrol Çubuğu -->
+    <header class="top-header">
+        <div class="url-bar-container">
+            <div class="brand">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                    <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+                <span>ImgCatcher</span>
+            </div>
+
+            <form id="scrape-form" class="url-form">
+                <input
+                    type="text"
+                    id="url-input"
+                    placeholder="Web sitesi veya forum konusu URL'sini yapıştırın (örn: https://...)"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+                <button type="submit" id="scrape-btn" class="btn-primary">
+                    <span class="btn-text">Görselleri Yakala</span>
+                </button>
+            </form>
+
+            <div class="folder-controls">
+                <button type="button" id="pick-folder-btn" class="btn-secondary" title="İndirme Klasörünü Değiştir">
+                    📁 <span id="folder-label">İndirilenler</span>
+                </button>
+                <button type="button" id="open-folder-btn" class="btn-icon" title="İndirme Klasörünü Windows Gezgini'nde Aç">
+                    ↗
+                </button>
+            </div>
+        </div>
+
+        <!-- Filtreleme ve İstatistik Çubuğu -->
+        <div class="toolbar">
+            <div class="filter-group">
+                <label for="min-size-select">Boyut Filtresi:</label>
+                <select id="min-size-select">
+                    <option value="0">Tümü (Filtresiz)</option>
+                    <option value="64">Çok Küçükleri Gizle (&ge; 64px)</option>
+                    <option value="120" selected>İkon &amp; Avatarları Gizle (&ge; 120px)</option>
+                    <option value="250">Orta ve Büyükler (&ge; 250px)</option>
+                    <option value="500">Sadece Büyük Görseller (&ge; 500px)</option>
+                </select>
+
+                <label class="checkbox-label" title="Küçük resme tıklandığında farklı/büyük bir görsel linkine gidenleri filtrele">
+                    <input type="checkbox" id="only-upgraded-cb">
+                    <span>Sadece HD Bağlantılılar</span>
+                </label>
+
+                <label class="checkbox-label" title="İndirilen görselleri site adına göre alt klasöre kaydet">
+                    <input type="checkbox" id="subfolder-cb" checked>
+                    <span>Site Alt Klasörü</span>
+                </label>
+            </div>
+
+            <div class="stats-and-actions">
+                <span id="stats-badge" class="stats-badge">Hazır</span>
+                <button type="button" id="download-all-btn" class="btn-accent" disabled>
+                    ⬇ Görünenlerin Tümünü İndir
+                </button>
+            </div>
+        </div>
+
+        <!-- Forum / Çoklu Sayfa Gezinme Çubuğu (Sayfalama algılandığında görünür) -->
+        <div id="pagination-bar" class="pagination-bar hidden">
+            <div class="pagination-left">
+                <span class="pagination-title">📄 Forum / Sayfa Gezgini:</span>
+                <button type="button" id="prev-page-btn" class="btn-page nav-btn" disabled>
+                    ◀ Önceki Sayfa
+                </button>
+                <div id="page-numbers" class="page-numbers"></div>
+                <button type="button" id="next-page-btn" class="btn-page nav-btn" disabled>
+                    Sonraki Sayfa ▶
+                </button>
+            </div>
+
+            <div class="pagination-right">
+                <button type="button" id="append-next-btn" class="btn-page btn-append hidden" title="Mevcut görselleri silmeden sonraki sayfanın görsellerini altına ekler">
+                    ➕ Sonraki Sayfayı Altına Ekle
+                </button>
+                <div id="jump-page-box" class="jump-page-box hidden">
+                    <input type="number" id="jump-page-input" min="1" placeholder="Sayfa #" />
+                    <button type="button" id="jump-page-btn" class="btn-page">Git</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Ana İçerik / Görsel Izgarası -->
+    <main class="main-content">
+        <div id="empty-state" class="empty-state">
+            <div class="empty-icon">🖼️</div>
+            <h2>Görselleri Yakalamaya Hazır</h2>
+            <p>
+                Yukarıya bir web sitesi veya forum konusu adresi yapıştırıp <strong>Görselleri Yakala</strong> butonuna basın.<br>
+                • Listelenen herhangi bir <strong>thumbnail'e tıkladığınızda</strong> tam boy orijinal görsel anında klasörünüze indirilir.<br>
+                • Forum sitelerinde <strong>Önceki / Sonraki sayfa</strong> butonları otomatik olarak üstte belirir.
+            </p>
+        </div>
+
+        <div id="loading-state" class="loading-state hidden">
+            <div class="spinner"></div>
+            <p id="loading-text">Sayfa taranıyor ve görseller yakalanıyor...</p>
+        </div>
+
+        <div id="image-grid" class="image-grid"></div>
+    </main>
+
+    <!-- Alt Bilgi / Alt Sayfalama Çubuğu -->
+    <footer id="bottom-pagination" class="bottom-pagination hidden">
+        <button type="button" id="bottom-prev-btn" class="btn-page nav-btn">◀ Önceki Sayfa</button>
+        <span id="bottom-page-info" class="bottom-page-info">Sayfa 1</span>
+        <button type="button" id="bottom-next-btn" class="btn-page nav-btn">Sonraki Sayfa ▶</button>
+        <button type="button" id="bottom-append-btn" class="btn-page btn-append">➕ Sonraki Sayfayı Ekle</button>
+    </footer>
+
+    <!-- Tam Ekran Önizleme (Lightbox) Modalı -->
+    <div id="lightbox-modal" class="lightbox-modal hidden">
+        <div class="lightbox-backdrop" id="lightbox-backdrop"></div>
+        <div class="lightbox-content">
+            <div class="lightbox-header">
+                <span id="lightbox-title">Görsel Önizleme</span>
+                <div class="lightbox-actions">
+                    <button type="button" id="lightbox-download-btn" class="btn-primary btn-sm">⬇ Orijinalini İndir</button>
+                    <button type="button" id="lightbox-close-btn" class="btn-icon">✕</button>
+                </div>
+            </div>
+            <div class="lightbox-body">
+                <img id="lightbox-img" src="" alt="Önizleme" />
+            </div>
+        </div>
+    </div>
+
+    <!-- Bildirim (Toast) Alanı -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
