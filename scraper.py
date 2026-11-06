@@ -1,5 +1,7 @@
+import os
 import re
-from urllib.parse import urljoin, urlparse, urlunparse
+import json
+from urllib.parse import urljoin, urlparse, unquote
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -17,6 +19,17 @@ DEFAULT_HEADERS = {
 
 IMAGE_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".svg", ".jfif", ".tiff"
+)
+
+VIDEO_EXTENSIONS = (
+    ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".m4v", ".m3u8", ".ts", ".ogv", ".3gp", ".wmv"
+)
+
+FILE_ARCHIVE_EXTENSIONS = (
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    ".pdf", ".epub", ".mobi", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".csv", ".json", ".xml", ".apk", ".exe", ".msi", ".dmg", ".iso", ".torrent",
+    ".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac"
 )
 
 ATTACHMENT_PATTERNS = re.compile(
@@ -41,11 +54,74 @@ KNOWN_IMAGE_HOST_DOMAINS = (
     "imgspice.com",
     "fastpic.org",
     "pixl.li",
-    " picstate.com",
+    "picstate.com",
     "imagevenue.com",
     "imgur.com",
     "flickr.com",
     "wallhaven.cc",
+)
+
+# Known video / streaming platforms & video hosts
+KNOWN_VIDEO_HOST_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "dailymotion.com",
+    "streamable.com",
+    "tiktok.com",
+    "redgifs.com",
+    "gfycat.com",
+    "twitch.tv",
+    "rumble.com",
+    "bitchute.com",
+    "odysee.com",
+    "vk.com",
+    "ok.ru",
+    "vidyard.com",
+    "wistia.com",
+    "loom.com",
+    "bunkr.",
+    "gofile.io",
+    "pixeldrain.com",
+    "cyberdrop.",
+    "saint2.",
+    "streamtape.com",
+    "doodstream.",
+    "voe.sx",
+    "mixdrop.",
+    "filemoon.",
+)
+
+# Known cloud / file sharing hosts
+KNOWN_CLOUD_HOST_DOMAINS = (
+    "mega.nz",
+    "mega.co.nz",
+    "drive.google.com",
+    "docs.google.com",
+    "mediafire.com",
+    "gofile.io",
+    "pixeldrain.com",
+    "bunkr.",
+    "cyberdrop.",
+    "1fichier.com",
+    "rapidgator.net",
+    "turbobit.net",
+    "nitroflare.com",
+    "katfile.com",
+    "uploaded.net",
+    "ddownload.com",
+    "dropbox.com",
+    "onedrive.live.com",
+    "yadi.sk",
+    "disk.yandex.",
+    "wetransfer.com",
+    "sendspace.com",
+    "zippyshare.com",
+    "krakenfiles.com",
+    "anonfiles.com",
+    "workupload.com",
+    "bowfile.com",
+    " hexupload.",
 )
 
 
@@ -82,6 +158,53 @@ def is_likely_image_or_viewer_url(url: str) -> bool:
     if re.search(r"(format=(jpg|jpeg|png|webp|gif)|image|img)", query_lower):
         return True
     return False
+
+
+def is_likely_video_url(url: str) -> tuple[bool, str]:
+    """
+    Checks if a URL is a direct video file, HLS/DASH stream, or a known video platform URL.
+    Returns (is_video: bool, source_type: 'direct' | 'stream' | 'embed' | 'ytdlp' | '').
+    """
+    if not url or url.startswith(("javascript:", "mailto:", "tel:", "#", "data:")):
+        return False, ""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path_lower = parsed.path.lower()
+    query_lower = parsed.query.lower()
+
+    if path_lower.endswith((".m3u8", ".mpd")):
+        return True, "stream"
+
+    if any(path_lower.endswith(ext) for ext in VIDEO_EXTENSIONS):
+        return True, "direct"
+
+    if any(ext in query_lower for ext in (".mp4", ".webm", ".mkv", ".mov", ".m3u8")):
+        return True, "direct"
+
+    if "mime=video" in query_lower or "content_type=video" in query_lower:
+        return True, "direct"
+
+    # Check known video platforms
+    if any(d in host for d in KNOWN_VIDEO_HOST_DOMAINS):
+        # Filter out channel/profile/home links on YouTube/Vimeo/etc.
+        if "youtube.com" in host:
+            if any(p in path_lower for p in ("/watch", "/shorts/", "/embed/", "/v/", "/live/")) or "v=" in query_lower:
+                return True, "ytdlp"
+            return False, ""
+        if "youtu.be" in host and len(path_lower.strip("/")) >= 5:
+            return True, "ytdlp"
+        if "vimeo.com" in host and re.search(r"/\d+", path_lower):
+            return True, "ytdlp"
+        if "vk.com" in host and "video" not in path_lower and "video" not in query_lower:
+            return False, ""
+        if "ok.ru" in host and "video" not in path_lower:
+            return False, ""
+        return True, "ytdlp"
+
+    if ("twitter.com" in host or "x.com" in host) and "/status/" in path_lower:
+        return True, "ytdlp"
+
+    return False, ""
 
 
 def transform_known_thumb_to_full(thumb_url: str, link_url: str = None) -> str:
@@ -285,28 +408,479 @@ def extract_real_image_from_viewer_html(html_text: str, viewer_url: str) -> str:
     return None
 
 
-def extract_filename(url: str, index: int, fallback_url: str = None) -> str:
+def extract_filename(url: str, index: int, fallback_url: str = None, default_prefix: str = "gorsel", default_ext: str = ".jpg", allowed_exts=IMAGE_EXTENSIONS) -> str:
     """Extracts a clean filename from a URL."""
     for candidate_url in (url, fallback_url):
         if not candidate_url or candidate_url.startswith("data:"):
             continue
         parsed = urlparse(candidate_url)
-        path = parsed.path.rstrip("/")
+        path = unquote(parsed.path).rstrip("/")
         segments = [s for s in path.split("/") if s]
         if not segments:
             continue
         name = segments[-1]
         # Convert XenForo slug like "photo-name-png.48291" -> "photo-name.png"
-        xf_match = re.match(r"^(.+)-(jpe?g|png|webp|gif|avif)\.\d+$", name, re.IGNORECASE)
+        xf_match = re.match(r"^(.+)-(jpe?g|png|webp|gif|avif|mp4|webm|mkv|mov)\.\d+$", name, re.IGNORECASE)
         if xf_match:
             name = f"{xf_match.group(1)}.{xf_match.group(2).lower()}"
         if name.lower().endswith(".html") or name.lower().endswith(".htm"):
             name = name[: name.rfind(".")]
-        name = re.sub(r'[<>:"/\\|?*]', "_", name)
-        if any(name.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
-            return name
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" ._")
+        if any(name.lower().endswith(ext) for ext in allowed_exts):
+            return name[:120]
 
-    return f"gorsel_{index:03d}.jpg"
+    return f"{default_prefix}_{index:03d}{default_ext}"
+
+
+def extract_video_filename(url: str, index: int, title: str = "") -> str:
+    """Extracts a clean filename for a video item."""
+    parsed = urlparse(url)
+    path = unquote(parsed.path).rstrip("/")
+    segments = [s for s in path.split("/") if s]
+    detected_ext = ".mp4"
+    for ext in VIDEO_EXTENSIONS:
+        if path.lower().endswith(ext):
+            detected_ext = ".mp4" if ext in (".m3u8", ".ts") else ext
+            break
+
+    if title and len(title.strip()) > 2:
+        clean_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title.strip()).strip(" ._")
+        clean_title = re.sub(r"\s+", " ", clean_title)[:90]
+        if clean_title:
+            if not any(clean_title.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                return f"{clean_title}{detected_ext}"
+            return clean_title
+
+    if segments:
+        last = segments[-1]
+        last_clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", last).strip(" ._")
+        if any(last_clean.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+            if last_clean.lower().endswith((".m3u8", ".ts")):
+                last_clean = last_clean[: last_clean.rfind(".")] + ".mp4"
+            return last_clean[:110]
+
+    return f"video_{index:03d}{detected_ext}"
+
+
+def extract_videos_from_soup(soup: BeautifulSoup, final_url: str, page_title: str = "") -> list:
+    """
+    Extracts all videos from the page:
+    - <video> and <source> elements
+    - Direct <a href="..."> video links (.mp4, .webm, .mkv, .mov, .m3u8, etc.)
+    - Embedded video iframes (YouTube, Vimeo, Dailymotion, Streamable, Redgifs, etc.)
+    - OpenGraph og:video / twitter:player:stream meta tags & JSON-LD VideoObject
+    """
+    videos = []
+    seen_urls = set()
+
+    og_image_tag = soup.find("meta", attrs={"property": "og:image"}) or soup.find("meta", attrs={"name": "twitter:image"})
+    default_poster = urljoin(final_url, og_image_tag["content"].strip()) if (og_image_tag and og_image_tag.get("content")) else ""
+
+    def add_video(video_url: str, thumb_url: str = "", title: str = "", source_type: str = "direct", width: int = 0, height: int = 0):
+        if not video_url or video_url.startswith(("javascript:", "mailto:", "#", "data:")):
+            return
+        full_v = urljoin(final_url, video_url.strip())
+        norm_u = full_v.split("#")[0]
+        if norm_u in seen_urls:
+            return
+        seen_urls.add(norm_u)
+
+        parsed = urlparse(full_v)
+        host = parsed.netloc.lower().replace("www.", "")
+        path_low = parsed.path.lower()
+
+        ext = ".mp4"
+        for v_ext in VIDEO_EXTENSIONS:
+            if path_low.endswith(v_ext):
+                ext = v_ext
+                break
+
+        if source_type == "direct" and ext in (".m3u8", ".ts"):
+            source_type = "stream"
+
+        idx = len(videos) + 1
+        clean_title = (title or "").strip()
+        if not clean_title:
+            clean_title = f"{page_title} - Video #{idx}" if page_title else f"Video #{idx}"
+
+        fname = extract_video_filename(full_v, idx, clean_title)
+        thumb_full = urljoin(final_url, thumb_url.strip()) if thumb_url and not thumb_url.startswith("data:") else default_poster
+
+        videos.append({
+            "id": idx,
+            "video_url": full_v,
+            "thumb_url": thumb_full,
+            "title": clean_title[:140],
+            "filename": fname,
+            "ext": ext,
+            "source_type": source_type,  # "direct" | "stream" | "embed" | "ytdlp"
+            "host": host,
+            "width": width,
+            "height": height,
+        })
+
+    # 1. Check if the current page URL itself is a known video platform watch URL (e.g. YouTube, Vimeo, Twitter video, etc.)
+    is_page_vid, page_vid_type = is_likely_video_url(final_url)
+    if is_page_vid:
+        add_video(final_url, default_poster, page_title, source_type=page_vid_type)
+
+    # 2. HTML5 <video> tags
+    for v_tag in soup.find_all("video"):
+        poster = v_tag.get("poster") or v_tag.get("data-poster") or ""
+        w = int(re.sub(r"[^\d]", "", str(v_tag.get("width") or 0)) or 0)
+        h = int(re.sub(r"[^\d]", "", str(v_tag.get("height") or 0)) or 0)
+        v_title = v_tag.get("title") or v_tag.get("aria-label") or v_tag.get("data-title") or ""
+
+        v_srcs = [
+            v_tag.get("src"),
+            v_tag.get("data-src"),
+            v_tag.get("data-video"),
+            v_tag.get("data-mp4"),
+        ]
+        for s in v_srcs:
+            if s:
+                add_video(s, poster, v_title, source_type="direct", width=w, height=h)
+
+        for src_tag in v_tag.find_all("source"):
+            s_url = src_tag.get("src") or src_tag.get("data-src")
+            s_type = (src_tag.get("type") or "").lower()
+            s_label = src_tag.get("label") or src_tag.get("res") or v_title
+            if s_url:
+                st = "stream" if ("mpegurl" in s_type or ".m3u8" in s_url.lower()) else "direct"
+                add_video(s_url, poster, s_label, source_type=st, width=w, height=h)
+
+    # 3. <iframe> and <embed> video players
+    for iframe in soup.find_all(["iframe", "embed"]):
+        i_src = iframe.get("src") or iframe.get("data-src") or iframe.get("data-lazy-src") or ""
+        if not i_src or i_src.startswith(("javascript:", "about:", "data:")):
+            continue
+        full_i = urljoin(final_url, i_src.strip())
+        i_title = iframe.get("title") or iframe.get("aria-label") or ""
+        is_vid, v_type = is_likely_video_url(full_i)
+        if is_vid or any(k in full_i.lower() for k in ("/embed/", "player.vimeo", "youtube.com/embed", "youtube-nocookie.com/embed", "dailymotion.com/embed", "redgifs.com/ifr", "streamable.com/e/")):
+            add_video(full_i, default_poster, i_title or f"Gömülü Video ({urlparse(full_i).netloc})", source_type="embed")
+
+    # 4. <a href="..."> links pointing to video files or video platforms
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag.get("href", "").strip()
+        if not href or href.startswith(("javascript:", "#", "mailto:")):
+            continue
+        full_href = urljoin(final_url, href)
+        is_vid, v_type = is_likely_video_url(full_href)
+        if is_vid:
+            a_text = a_tag.get_text(" ", strip=True) or a_tag.get("title") or ""
+            # Check if there's an <img> inside the <a> for thumbnail
+            inner_img = a_tag.find("img")
+            thumb = ""
+            if inner_img:
+                thumb = inner_img.get("data-src") or inner_img.get("src") or ""
+            add_video(full_href, thumb, a_text, source_type=v_type)
+
+    # 5. OpenGraph & Twitter video meta tags
+    for meta_prop in ("og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream"):
+        m_tag = soup.find("meta", attrs={"property": meta_prop}) or soup.find("meta", attrs={"name": meta_prop})
+        if m_tag and m_tag.get("content"):
+            m_url = urljoin(final_url, m_tag["content"].strip())
+            is_vid, v_type = is_likely_video_url(m_url)
+            add_video(m_url, default_poster, page_title, source_type=v_type or "direct")
+
+    # 6. JSON-LD VideoObject
+    for script_tag in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        raw_json = script_tag.string or script_tag.get_text()
+        if not raw_json:
+            continue
+        try:
+            parsed_ld = json.loads(raw_json)
+            items = parsed_ld if isinstance(parsed_ld, list) else [parsed_ld]
+            for obj in items:
+                if not isinstance(obj, dict):
+                    continue
+                graph = obj.get("@graph", [obj])
+                for node in (graph if isinstance(graph, list) else [graph]):
+                    if isinstance(node, dict) and "VideoObject" in str(node.get("@type", "")):
+                        c_url = node.get("contentUrl") or node.get("embedUrl")
+                        t_url = node.get("thumbnailUrl")
+                        if isinstance(t_url, list) and t_url:
+                            t_url = t_url[0]
+                        v_name = node.get("name") or page_title
+                        if c_url:
+                            _, vt = is_likely_video_url(c_url)
+                            add_video(c_url, t_url if isinstance(t_url, str) else "", v_name, source_type=vt or "direct")
+        except Exception:
+            pass
+
+    return videos
+
+
+def categorize_link(url: str, page_domain: str = "") -> tuple[str, str, bool]:
+    """
+    Categorizes a hyperlink into:
+    (category_key, category_label_tr, is_external)
+    Categories: 'file', 'video', 'image', 'cloud', 'webpage'
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().replace("www.", "")
+    path_low = unquote(parsed.path).lower()
+    is_external = bool(host and page_domain and host != page_domain)
+
+    if any(path_low.endswith(ext) for ext in FILE_ARCHIVE_EXTENSIONS):
+        return "file", "📦 Dosya / Belge", is_external
+
+    is_vid, _ = is_likely_video_url(url)
+    if is_vid:
+        return "video", "🎬 Video Bağlantısı", is_external
+
+    if any(path_low.endswith(ext) for ext in IMAGE_EXTENSIONS) or any(d in host for d in KNOWN_IMAGE_HOST_DOMAINS):
+        return "image", "🖼️ Görsel Bağlantısı", is_external
+
+    if any(d in host for d in KNOWN_CLOUD_HOST_DOMAINS):
+        return "cloud", "☁️ Bulut / Dosya Host", is_external
+
+    if ATTACHMENT_PATTERNS.search(url):
+        return "file", "📎 Forum Eki (Attachment)", is_external
+
+    return "webpage", "🌐 Web Sayfası", is_external
+
+
+def clean_element_text(el) -> str:
+    """Extracts readable, well-spaced text from a BeautifulSoup element."""
+    clone = BeautifulSoup(str(el), "lxml")
+    for junk in clone.find_all(["script", "style", "noscript", "svg", "iframe", "form", "button"]):
+        junk.decompose()
+
+    # Replace <br> and block endings with newlines
+    for br in clone.find_all("br"):
+        br.replace_with("\n")
+    for p in clone.find_all(["p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"]):
+        p.append("\n")
+
+    raw_text = clone.get_text()
+    lines = []
+    for line in raw_text.splitlines():
+        cleaned_line = re.sub(r"[ \t\r\f\v]+", " ", line).strip()
+        if cleaned_line:
+            lines.append(cleaned_line)
+        elif lines and lines[-1] != "":
+            lines.append("")
+
+    # Collapse multiple blank lines
+    result = "\n".join(lines).strip()
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result
+
+
+def extract_links_from_element(el, base_url: str, page_domain: str) -> list:
+    """Extracts all meaningful hyperlinks inside a given HTML element."""
+    links = []
+    seen = set()
+
+    # Common boilerplate navigation/action patterns to skip inside post bodies
+    skip_patterns = (
+        "/login", "/register", "/logout", "/search", "/members/",
+        "javascript:", "mailto:", "tel:", "#"
+    )
+
+    for a_tag in el.find_all("a", href=True):
+        raw_href = (a_tag.get("href") or "").strip()
+        if not raw_href or raw_href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        full_u = urljoin(base_url, raw_href)
+        norm_u = full_u.split("#")[0]
+        if not norm_u or norm_u in seen:
+            continue
+
+        # Skip self anchor or pure forum quote jump links like /goto/post?id=...
+        if any(sp in raw_href.lower() for sp in skip_patterns):
+            continue
+        if re.search(r"/(goto/post|posts/\d+/reply|posts/\d+/react|posts/\d+/report|misc/contact)", full_u.lower()):
+            continue
+
+        seen.add(norm_u)
+        anchor_text = a_tag.get_text(" ", strip=True)
+        if not anchor_text:
+            img = a_tag.find("img")
+            if img:
+                anchor_text = img.get("alt") or img.get("title") or "Görsel Bağlantısı"
+            else:
+                anchor_text = a_tag.get("title") or a_tag.get("aria-label") or unquote(urlparse(full_u).path.split("/")[-1]) or full_u
+
+        cat_key, cat_label, is_ext = categorize_link(full_u, page_domain)
+        domain = urlparse(full_u).netloc.replace("www.", "")
+
+        links.append({
+            "url": full_u,
+            "text": anchor_text[:140],
+            "domain": domain,
+            "category": cat_key,
+            "category_label": cat_label,
+            "is_external": is_ext,
+        })
+
+    # Sort links so cloud/file/video/external links appear prominently first
+    priority_map = {"cloud": 0, "file": 1, "video": 2, "image": 3, "webpage": 4}
+    links.sort(key=lambda x: (priority_map.get(x["category"], 5), 0 if x["is_external"] else 1))
+    return links
+
+
+def extract_texts_and_links(soup: BeautifulSoup, final_url: str, page_title: str = "") -> tuple[list, list]:
+    """
+    Extracts structured text blocks (forum posts, articles, or page content) and their associated links.
+    Returns (texts_list, all_page_links_list).
+    """
+    page_domain = urlparse(final_url).netloc.lower().replace("www.", "")
+    texts = []
+
+    # 1. Try detecting structured forum posts or article containers
+    post_selectors = [
+        "article.message",                  # XenForo 2
+        "li.message",                       # XenForo 1
+        "div.post",                         # vBulletin / phpBB / MyBB
+        "div.postbody",                     # phpBB
+        "div.topic-post",                   # Discourse
+        "div[id^='post_message_']",         # vBulletin
+        "div.comment-body",                 # General comments
+        "article",                          # Blog / News articles
+    ]
+
+    found_posts = []
+    for sel in post_selectors:
+        candidates = soup.select(sel)
+        if candidates:
+            found_posts = candidates
+            break
+
+    post_blocks = []
+    for idx, post_el in enumerate(found_posts[:60], start=1):
+        # Try finding the specific message body inside a forum post container
+        body_el = (
+            post_el.select_one(".message-body .bbWrapper")
+            or post_el.select_one(".message-body")
+            or post_el.select_one(".postcontent")
+            or post_el.select_one(".content")
+            or post_el.select_one(".entry-content")
+            or post_el.select_one(".post-content")
+            or post_el
+        )
+
+        author = (
+            post_el.get("data-author")
+            or (post_el.select_one(".message-name, .username, .author, [itemprop='name'], .postauthor") and
+                post_el.select_one(".message-name, .username, .author, [itemprop='name'], .postauthor").get_text(strip=True))
+            or ""
+        )
+
+        date_str = ""
+        time_el = post_el.find("time") or post_el.select_one(".message-date, .postdate, .date")
+        if time_el:
+            date_str = time_el.get_text(" ", strip=True) or time_el.get("datetime") or ""
+
+        heading_el = post_el.find(["h1", "h2", "h3"])
+        heading_txt = heading_el.get_text(" ", strip=True) if heading_el else ""
+
+        clean_txt = clean_element_text(body_el)
+        block_links = extract_links_from_element(body_el, final_url, page_domain)
+
+        # Keep block if it has meaningful text or links
+        if len(clean_txt) < 15 and not block_links:
+            continue
+
+        title_parts = []
+        if author:
+            title_parts.append(f"👤 {author}")
+        if heading_txt and heading_txt != author:
+            title_parts.append(heading_txt[:70])
+        if not title_parts:
+            title_parts.append(f"Bölüm / Mesaj #{len(post_blocks) + 1}")
+
+        block_title = f"#{len(post_blocks) + 1} — " + " • ".join(title_parts)
+        words = len(clean_txt.split())
+
+        post_blocks.append({
+            "id": len(post_blocks) + 2,  # ID 1 is reserved for Full Page Summary
+            "title": block_title,
+            "author": author,
+            "date": date_str[:40],
+            "text": clean_txt,
+            "char_count": len(clean_txt),
+            "word_count": words,
+            "links": block_links,
+            "is_full_page": False,
+            "filename": f"metin_bolum_{len(post_blocks) + 1:02d}.txt",
+        })
+
+    # 2. Extract full page main content text & all links
+    main_container = (
+        soup.find("main")
+        or soup.select_one("#content, .p-body-main, .main-content, #main, article, .container")
+        or soup.body
+        or soup
+    )
+
+    if post_blocks:
+        # Combine all post blocks into a clean full-page compilation
+        combined_sections = []
+        seen_links_map = {}
+        for pb in post_blocks:
+            header_line = f"=== {pb['title']} {('(' + pb['date'] + ')') if pb['date'] else ''} ==="
+            section_str = f"{header_line}\n{pb['text']}"
+            if pb["links"]:
+                links_str = "\n".join(f"  - [{l['category_label']}] {l['text']}: {l['url']}" for l in pb["links"])
+                section_str += f"\n\n[Bu Bölümdeki Bağlantılar ({len(pb['links'])})]:\n{links_str}"
+            combined_sections.append(section_str)
+            for l in pb["links"]:
+                seen_links_map[l["url"]] = l
+
+        full_text = "\n\n" + ("\n\n" + "-" * 60 + "\n\n").join(combined_sections)
+        full_text = f"Sayfa Başlığı: {page_title}\nKaynak URL: {final_url}\n" + full_text
+        all_links = list(seen_links_map.values())
+    else:
+        full_body_text = clean_element_text(main_container)
+        all_links = extract_links_from_element(main_container, final_url, page_domain)
+        full_text = f"Sayfa Başlığı: {page_title}\nKaynak URL: {final_url}\n\n{full_body_text}"
+
+    # Create #1 Summary Entry ("Tüm Sayfa Metni & Bağlantılar")
+    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (page_title or "sayfa_metni")).strip(" ._")[:60] or "sayfa_metni"
+    texts.append({
+        "id": 1,
+        "title": f"📑 Tüm Sayfa Metni & Bağlantılar ({page_title[:65]})",
+        "author": "Tam Sayfa",
+        "date": "",
+        "text": full_text.strip(),
+        "char_count": len(full_text),
+        "word_count": len(full_text.split()),
+        "links": all_links,
+        "is_full_page": True,
+        "filename": f"{safe_title}_tam_metin.txt",
+    })
+
+    texts.extend(post_blocks)
+    return texts, all_links
+
+
+def format_text_with_links_for_txt(title: str, source_url: str, text_body: str, links: list = None, include_links: bool = True) -> str:
+    """Formats a text item and its detected links into a clean UTF-8 .txt document."""
+    lines = [
+        "=" * 70,
+        f"BAŞLIK : {title}",
+        f"KAYNAK : {source_url}",
+        "=" * 70,
+        "",
+        text_body.strip(),
+    ]
+    if include_links and links:
+        lines.extend([
+            "",
+            "=" * 70,
+            f"İÇERİKTEKİ BAĞLANTILAR / LİNKLER ({len(links)} Adet)",
+            "=" * 70,
+        ])
+        for i, lnk in enumerate(links, start=1):
+            label = lnk.get("category_label") or "Link"
+            txt = lnk.get("text") or ""
+            u = lnk.get("url") or ""
+            lines.append(f"{i:02d}. [{label}] {txt}\n    URL: {u}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def detect_pagination(soup: BeautifulSoup, current_url: str):
@@ -480,13 +1054,27 @@ def scrape_page(url: str, session=None):
         url = "https://" + url
 
     sess = session or create_session()
-    resp = sess.get(url, timeout=20)
+
+    # Use stream=True first so if the user pastes a direct link to a 500MB video/file, we don't load 500MB into RAM during scrape!
+    resp = sess.get(url, timeout=25, stream=True)
     resp.raise_for_status()
 
     final_url = str(resp.url)
     content_type = (resp.headers.get("Content-Type") or "").lower()
+    content_length = int(resp.headers.get("Content-Length") or 0)
 
+    empty_pagination = {
+        "has_pagination": False,
+        "current_page": 1,
+        "prev_url": None,
+        "next_url": None,
+        "pages": [],
+        "page_url_template": None,
+    }
+
+    # Case 1: Direct Image URL
     if content_type.startswith("image/"):
+        resp.close()
         fname = extract_filename(final_url, 1)
         return {
             "page_title": fname,
@@ -503,17 +1091,77 @@ def scrape_page(url: str, session=None):
                     "filename": fname,
                 }
             ],
-            "pagination": {
-                "has_pagination": False,
-                "current_page": 1,
-                "prev_url": None,
-                "next_url": None,
-                "pages": [],
-                "page_url_template": None,
-            },
+            "videos": [],
+            "texts": [],
+            "links": [],
+            "pagination": empty_pagination,
         }
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    # Case 2: Direct Video Stream / File URL
+    if content_type.startswith("video/") or any(urlparse(final_url).path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+        resp.close()
+        fname = extract_video_filename(final_url, 1)
+        return {
+            "page_title": fname,
+            "final_url": final_url,
+            "images": [],
+            "videos": [
+                {
+                    "id": 1,
+                    "video_url": final_url,
+                    "thumb_url": "",
+                    "title": fname,
+                    "filename": fname,
+                    "ext": os.path.splitext(fname)[1] if "." in fname else ".mp4",
+                    "source_type": "direct",
+                    "host": urlparse(final_url).netloc.replace("www.", ""),
+                    "width": 0,
+                    "height": 0,
+                    "size_bytes": content_length,
+                }
+            ],
+            "texts": [],
+            "links": [],
+            "pagination": empty_pagination,
+        }
+
+    # Case 3: Plain text document URL
+    if content_type.startswith("text/plain"):
+        raw_bytes = resp.raw.read(2 * 1024 * 1024, decode_content=True)
+        resp.close()
+        text_content = raw_bytes.decode("utf-8", errors="replace")
+        fname = unquote(urlparse(final_url).path.split("/")[-1]) or "metin.txt"
+        if not fname.lower().endswith(".txt"):
+            fname += ".txt"
+        return {
+            "page_title": fname,
+            "final_url": final_url,
+            "images": [],
+            "videos": [],
+            "texts": [
+                {
+                    "id": 1,
+                    "title": fname,
+                    "author": "",
+                    "date": "",
+                    "text": text_content,
+                    "char_count": len(text_content),
+                    "word_count": len(text_content.split()),
+                    "links": [],
+                    "is_full_page": True,
+                    "filename": fname,
+                }
+            ],
+            "links": [],
+            "pagination": empty_pagination,
+        }
+
+    # Read HTML content
+    html_bytes = resp.content
+    resp.close()
+    html_text = html_bytes.decode(resp.encoding or "utf-8", errors="replace")
+
+    soup = BeautifulSoup(html_text, "lxml")
     page_title = (
         soup.title.string.strip()
         if soup.title and soup.title.string
@@ -598,11 +1246,21 @@ def scrape_page(url: str, session=None):
         og_url = urljoin(final_url, og_img["content"].strip())
         add_image_entry(og_url, og_url, 0, 0, "Kapak Görseli (og:image)", source_type="meta")
 
+    # Extract Videos
+    videos = extract_videos_from_soup(soup, final_url, page_title)
+
+    # Extract Texts & Links
+    texts, links = extract_texts_and_links(soup, final_url, page_title)
+
+    # Extract Pagination
     pagination = detect_pagination(soup, final_url)
 
     return {
         "page_title": page_title,
         "final_url": final_url,
         "images": images,
+        "videos": videos,
+        "texts": texts,
+        "links": links,
         "pagination": pagination,
     }

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Görsel Yakalayıcı & Forum İndirici</title>
+    <title>ImgCatcher Pro — Görsel, Video, Metin &amp; Link İndirici</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -16,23 +16,30 @@
                     <circle cx="8.5" cy="8.5" r="1.5"></circle>
                     <polyline points="21 15 16 10 5 21"></polyline>
                 </svg>
-                <span>ImgCatcher</span>
+                <span>ImgCatcher <small class="pro-tag">PRO</small></span>
             </div>
 
             <form id="scrape-form" class="url-form">
                 <input
                     type="text"
                     id="url-input"
-                    placeholder="Web sitesi veya forum konusu URL'sini yapıştırın (örn: https://...)"
+                    placeholder="Web sitesi, forum konusu veya video URL'sini yapıştırın (örn: https://...)"
                     autocomplete="off"
                     spellcheck="false"
                 />
                 <button type="submit" id="scrape-btn" class="btn-primary">
-                    <span class="btn-text">Görselleri Yakala</span>
+                    <span class="btn-text">🔍 Sayfayı Yakala</span>
                 </button>
             </form>
 
             <div class="folder-controls">
+                <button type="button" id="github-update-btn" class="btn-update" title="GitHub (yogruce/threadsnap) üzerinden güncellemeleri kontrol et ve tek tıkla güncelle">
+                    🔄 <span id="update-btn-label">Güncelle</span>
+                    <span id="update-dot" class="update-dot hidden"></span>
+                </button>
+                <button type="button" id="toggle-queue-btn" class="btn-queue" title="İndirme Kuyruğunu ve Sıradaki Büyük Dosyaları Göster">
+                    📥 Kuyruk <span id="queue-badge" class="queue-count-badge">0</span>
+                </button>
                 <button type="button" id="pick-folder-btn" class="btn-secondary" title="İndirme Klasörünü Değiştir">
                     📁 <span id="folder-label">İndirilenler</span>
                 </button>
@@ -42,30 +49,58 @@
             </div>
         </div>
 
-        <!-- Filtreleme ve İstatistik Çubuğu -->
+        <!-- Kategori Sekmeleri ve Filtreleme Çubuğu -->
         <div class="toolbar">
-            <div class="filter-group">
-                <label for="min-size-select">Boyut Filtresi:</label>
+            <!-- Sekmeler (Görseller / Videolar / Metin & Linkler / Tüm Linkler) -->
+            <div class="category-tabs">
+                <button type="button" class="tab-btn active" data-tab="images" id="tab-btn-images">
+                    🖼️ Görseller <span class="tab-count" id="count-images">0</span>
+                </button>
+                <button type="button" class="tab-btn" data-tab="videos" id="tab-btn-videos">
+                    🎬 Videolar <span class="tab-count" id="count-videos">0</span>
+                </button>
+                <button type="button" class="tab-btn" data-tab="texts" id="tab-btn-texts">
+                    📝 Metin &amp; İçerik <span class="tab-count" id="count-texts">0</span>
+                </button>
+                <button type="button" class="tab-btn" data-tab="links" id="tab-btn-links">
+                    🔗 Bağlantılar (Link) <span class="tab-count" id="count-links">0</span>
+                </button>
+            </div>
+
+            <!-- Görsel Filtreleri (Görseller sekmesinde aktif) -->
+            <div class="filter-group" id="image-filters-bar">
+                <label for="min-size-select">Boyut:</label>
                 <select id="min-size-select">
                     <option value="0">Tümü (Filtresiz)</option>
-                    <option value="64">Çok Küçükleri Gizle (&ge; 64px)</option>
-                    <option value="120" selected>İkon &amp; Avatarları Gizle (&ge; 120px)</option>
-                    <option value="250">Orta ve Büyükler (&ge; 250px)</option>
-                    <option value="500">Sadece Büyük Görseller (&ge; 500px)</option>
+                    <option value="64">&ge; 64px</option>
+                    <option value="120" selected>İkonları Gizle (&ge; 120px)</option>
+                    <option value="250">Orta ve Büyük (&ge; 250px)</option>
+                    <option value="500">Sadece Büyük (&ge; 500px)</option>
                 </select>
 
                 <label class="checkbox-label" title="Küçük resme tıklandığında farklı/büyük bir görsel linkine gidenleri filtrele">
                     <input type="checkbox" id="only-upgraded-cb">
                     <span>Sadece HD Bağlantılılar</span>
                 </label>
+            </div>
 
-                <label class="checkbox-label" title="İndirilen görselleri site adına göre alt klasöre kaydet">
+            <!-- Ortak Ayarlar & Toplu İndirme -->
+            <div class="stats-and-actions">
+                <label for="threshold-select" class="threshold-label" title="Bu boyuttan büyük dosyalar ve çoklu indirmeler otomatik olarak sıraya alınır">
+                    Sıra Eşiği:
+                    <select id="threshold-select">
+                        <option value="1">&ge; 1 MB Sırala</option>
+                        <option value="5" selected>&ge; 5 MB Sırala</option>
+                        <option value="15">&ge; 15 MB Sırala</option>
+                        <option value="50">&ge; 50 MB Sırala</option>
+                    </select>
+                </label>
+
+                <label class="checkbox-label" title="İndirilen dosyaları site adına göre alt klasöre kaydet">
                     <input type="checkbox" id="subfolder-cb" checked>
                     <span>Site Alt Klasörü</span>
                 </label>
-            </div>
 
-            <div class="stats-and-actions">
                 <span id="stats-badge" class="stats-badge">Hazır</span>
                 <button type="button" id="download-all-btn" class="btn-accent" disabled>
                     ⬇ Görünenlerin Tümünü İndir
@@ -87,7 +122,7 @@
             </div>
 
             <div class="pagination-right">
-                <button type="button" id="append-next-btn" class="btn-page btn-append hidden" title="Mevcut görselleri silmeden sonraki sayfanın görsellerini altına ekler">
+                <button type="button" id="append-next-btn" class="btn-page btn-append hidden" title="Mevcut içerikleri silmeden sonraki sayfanın görsel, video ve metinlerini altına ekler">
                     ➕ Sonraki Sayfayı Altına Ekle
                 </button>
                 <div id="jump-page-box" class="jump-page-box hidden">
@@ -98,24 +133,91 @@
         </div>
     </header>
 
-    <!-- Ana İçerik / Görsel Izgarası -->
+    <!-- Ana İçerik Alanı -->
     <main class="main-content">
         <div id="empty-state" class="empty-state">
-            <div class="empty-icon">🖼️</div>
-            <h2>Görselleri Yakalamaya Hazır</h2>
+            <div class="empty-icon">🚀</div>
+            <h2>Görsel, Video, Metin ve Link Yakalayıcı</h2>
             <p>
-                Yukarıya bir web sitesi veya forum konusu adresi yapıştırıp <strong>Görselleri Yakala</strong> butonuna basın.<br>
-                • Listelenen herhangi bir <strong>thumbnail'e tıkladığınızda</strong> tam boy orijinal görsel anında klasörünüze indirilir.<br>
-                • Forum sitelerinde <strong>Önceki / Sonraki sayfa</strong> butonları otomatik olarak üstte belirir.
+                Yukarıya bir web sitesi, forum konusu veya video adresi yapıştırıp <strong>Sayfayı Yakala</strong> butonuna basın.<br>
+                • <strong>🖼️ Görseller:</strong> Küçük resimlere (thumbnail) tıkladığınızda tam boy HD orijinal görsel indirilir.<br>
+                • <strong>🎬 Videolar:</strong> Sayfadaki MP4/WebM videoları, akışları ve gömülü videoları yakalar ve indirir.<br>
+                • <strong>📝 Metin &amp; Linkler:</strong> Sayfa/forum yazılarını ve içindeki linkleri belirtir; ister <code>.txt</code> olarak ister linkin hedef içeriğini indirir.<br>
+                • <strong>📥 Akıllı Kuyruk:</strong> Birden fazla indirmede ve büyük dosyalarda indirmeleri otomatik sıraya alır.
             </p>
         </div>
 
         <div id="loading-state" class="loading-state hidden">
             <div class="spinner"></div>
-            <p id="loading-text">Sayfa taranıyor ve görseller yakalanıyor...</p>
+            <p id="loading-text">Sayfa taranıyor; görseller, videolar, metinler ve linkler yakalanıyor...</p>
         </div>
 
-        <div id="image-grid" class="image-grid"></div>
+        <!-- SEKME 1: GÖRSELLER IZGARASI -->
+        <section id="tab-panel-images" class="tab-panel">
+            <div id="image-grid" class="image-grid"></div>
+        </section>
+
+        <!-- SEKME 2: VİDEOLAR IZGARASI -->
+        <section id="tab-panel-videos" class="tab-panel hidden">
+            <div class="panel-action-bar" id="video-action-bar">
+                <div class="panel-info">
+                    <span>🎬 Sayfada tespit edilen doğrudan videolar, yayın akışları ve gömülü video bağlantıları. Büyük videolar otomatik olarak sıraya alınır.</span>
+                </div>
+                <div class="panel-buttons">
+                    <button type="button" id="download-all-videos-btn" class="btn-accent">
+                        ⬇ Tüm Videoları Sırayla İndir
+                    </button>
+                </div>
+            </div>
+            <div id="video-grid" class="video-grid"></div>
+        </section>
+
+        <!-- SEKME 3: METİN & İÇERİKTEKİ LİNKLER -->
+        <section id="tab-panel-texts" class="tab-panel hidden">
+            <div class="panel-action-bar">
+                <div class="panel-info">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="include-links-txt-cb" checked>
+                        <span><strong>.txt</strong> indirirken metin içindeki linkleri de dosya sonuna ekle</span>
+                    </label>
+                </div>
+                <div class="panel-buttons">
+                    <button type="button" id="download-full-text-btn" class="btn-primary btn-sm">
+                        📄 Tüm Sayfa Metnini (.txt) İndir
+                    </button>
+                    <button type="button" id="download-all-links-txt-btn" class="btn-secondary btn-sm">
+                        🔗 Tüm Link Listesini (.txt) İndir
+                    </button>
+                </div>
+            </div>
+            <div id="text-list" class="text-list"></div>
+        </section>
+
+        <!-- SEKME 4: TÜM BAĞLANTILAR (LİNKLER) -->
+        <section id="tab-panel-links" class="tab-panel hidden">
+            <div class="panel-action-bar">
+                <div class="filter-group">
+                    <label for="link-category-filter">Link Türü:</label>
+                    <select id="link-category-filter">
+                        <option value="all">Tümü</option>
+                        <option value="cloud_file">📦 Dosya, Arşiv &amp; Bulut Host</option>
+                        <option value="media">🎬 Video &amp; 🖼️ Görsel Linkleri</option>
+                        <option value="external">🌐 Sadece Dış Bağlantılar</option>
+                        <option value="webpage">📄 Web Sayfaları</option>
+                    </select>
+                    <input type="text" id="link-search-input" class="small-input" placeholder="Link veya metin filtrele..." />
+                </div>
+                <div class="panel-buttons">
+                    <button type="button" id="export-filtered-links-txt-btn" class="btn-secondary btn-sm">
+                        📄 Görünen Linkleri (.txt) Kaydet
+                    </button>
+                    <button type="button" id="download-filtered-links-content-btn" class="btn-accent btn-sm">
+                        📥 Görünen Linklerin İçeriğini Sırayla İndir
+                    </button>
+                </div>
+            </div>
+            <div id="links-list-container" class="links-table-container"></div>
+        </section>
     </main>
 
     <!-- Alt Bilgi / Alt Sayfalama Çubuğu -->
@@ -126,19 +228,80 @@
         <button type="button" id="bottom-append-btn" class="btn-page btn-append">➕ Sonraki Sayfayı Ekle</button>
     </footer>
 
-    <!-- Tam Ekran Önizleme (Lightbox) Modalı -->
+    <!-- AKILLI İNDİRME KUYRUĞU PANELİ (DRAWER / FLOATING PANEL) -->
+    <aside id="queue-panel" class="queue-panel hidden">
+        <div class="queue-header">
+            <div class="queue-title-group">
+                <span>📥 İndirme Sırası &amp; Yöneticisi</span>
+                <span id="queue-summary-text" class="queue-summary-sub">Hazır</span>
+            </div>
+            <div class="queue-header-actions">
+                <button type="button" id="queue-clear-btn" class="btn-xs" title="Tamamlanan ve İptal Edilenleri Temizle">Temizle</button>
+                <button type="button" id="queue-cancel-all-btn" class="btn-xs btn-danger-outline" title="Bekleyen Tüm İndirmeleri İptal Et">Tümünü İptal</button>
+                <button type="button" id="queue-close-btn" class="btn-icon-xs">✕</button>
+            </div>
+        </div>
+        <div id="queue-items-list" class="queue-items-list">
+            <div class="queue-empty">Henüz kuyrukta indirme yok.</div>
+        </div>
+    </aside>
+
+    <!-- Tam Ekran Önizleme (Lightbox - Görsel & Video) Modalı -->
     <div id="lightbox-modal" class="lightbox-modal hidden">
         <div class="lightbox-backdrop" id="lightbox-backdrop"></div>
         <div class="lightbox-content">
             <div class="lightbox-header">
-                <span id="lightbox-title">Görsel Önizleme</span>
+                <span id="lightbox-title">Önizleme</span>
                 <div class="lightbox-actions">
-                    <button type="button" id="lightbox-download-btn" class="btn-primary btn-sm">⬇ Orijinalini İndir</button>
+                    <button type="button" id="lightbox-download-btn" class="btn-primary btn-sm">⬇ İndir (Kuyruğa Ekle)</button>
                     <button type="button" id="lightbox-close-btn" class="btn-icon">✕</button>
                 </div>
             </div>
             <div class="lightbox-body">
                 <img id="lightbox-img" src="" alt="Önizleme" />
+                <video id="lightbox-video" class="hidden" controls playsinline></video>
+            </div>
+        </div>
+    </div>
+
+    <!-- GitHub Otomatik Güncelleme Modalı -->
+    <div id="update-modal" class="lightbox-modal hidden">
+        <div class="lightbox-backdrop" id="update-backdrop"></div>
+        <div class="update-modal-card">
+            <div class="lightbox-header">
+                <span class="update-modal-title">🔄 GitHub Otomatik Güncelleyici</span>
+                <button type="button" id="update-close-btn" class="btn-icon-xs">✕</button>
+            </div>
+            <div class="update-modal-body">
+                <div class="update-status-row">
+                    <div>
+                        <div class="update-label">GitHub Deposu</div>
+                        <div id="update-repo-name" class="update-value">yogruce/threadsnap (main)</div>
+                    </div>
+                    <div>
+                        <div class="update-label">Mevcut Sürüm</div>
+                        <div id="update-local-sha" class="update-value">Kontrol ediliyor...</div>
+                    </div>
+                    <div>
+                        <div class="update-label">GitHub Sürümü</div>
+                        <div id="update-remote-sha" class="update-value">...</div>
+                    </div>
+                </div>
+
+                <div id="update-status-banner" class="update-banner">
+                    GitHub sunucusuna bağlanılıyor...
+                </div>
+
+                <div class="update-changelog-box">
+                    <div class="update-label">Son Değişiklikler / Güncelleme Notları:</div>
+                    <ul id="update-changelog-list" class="update-changelog-list">
+                        <li>Yükleniyor...</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="update-modal-footer">
+                <button type="button" id="update-check-again-btn" class="btn-secondary btn-sm">🔍 Tekrar Kontrol Et</button>
+                <button type="button" id="update-apply-btn" class="btn-primary btn-sm">🚀 Şimdi Güncelle &amp; Yeniden Başlat</button>
             </div>
         </div>
     </div>
