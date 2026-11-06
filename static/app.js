@@ -15,6 +15,7 @@ const state = {
     queueTasks: [],
     notifiedTaskIds: new Set(),
     queuePollTimer: null,
+    scrapeEpoch: 0,
 };
 
 // DOM Elements
@@ -129,12 +130,15 @@ function updateFolderLabel(fullPath) {
     pickFolderBtn.title = `İndirme Klasörü: ${fullPath}\n(Değiştirmek için tıklayın)`;
 }
 
-function buildProxyUrl(imgUrl, referer, fallbackThumb = "") {
+function buildProxyUrl(imgUrl, referer, fallbackThumb = "", includeEpoch = false) {
     if (!imgUrl) return "";
     if (imgUrl.startsWith("data:")) return imgUrl;
     const params = new URLSearchParams({ url: imgUrl, referer: referer || state.currentUrl });
     if (fallbackThumb && fallbackThumb !== imgUrl && !fallbackThumb.startsWith("data:")) {
         params.set("thumb", fallbackThumb);
+    }
+    if (includeEpoch && state.scrapeEpoch) {
+        params.set("sid", String(state.scrapeEpoch));
     }
     return `/api/proxy?${params.toString()}`;
 }
@@ -207,7 +211,16 @@ async function scrapeUrl(targetUrl, appendMode = false) {
         : "Sayfa taranıyor; görseller, videolar, metinler ve linkler yakalanıyor...";
     scrapeBtn.disabled = true;
 
+    const previousUrl = state.currentUrl || "";
+
     if (!appendMode) {
+        // Cancel any pending thumbnail HTTP requests from the previous page so browser sockets free immediately
+        imageGrid.querySelectorAll("img").forEach((img) => {
+            img.src = "";
+        });
+        videoGrid.querySelectorAll("img").forEach((img) => {
+            img.src = "";
+        });
         imageGrid.innerHTML = "";
         videoGrid.innerHTML = "";
         textList.innerHTML = "";
@@ -223,7 +236,11 @@ async function scrapeUrl(targetUrl, appendMode = false) {
         const res = await fetch("/api/scrape", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: targetUrl }),
+            body: JSON.stringify({
+                url: targetUrl,
+                referer: previousUrl,
+                append: appendMode,
+            }),
         });
         const data = await res.json();
 
@@ -231,6 +248,9 @@ async function scrapeUrl(targetUrl, appendMode = false) {
             throw new Error(data.error || "Sayfa taranamadı.");
         }
 
+        if (data.scrape_epoch) {
+            state.scrapeEpoch = data.scrape_epoch;
+        }
         state.currentUrl = data.final_url || targetUrl;
         state.pageTitle = data.page_title || "";
         state.pagination = data.pagination;
@@ -310,7 +330,7 @@ function renderNewImages(items, pageReferer) {
             card.classList.add("downloaded");
         }
 
-        const proxyThumbSrc = buildProxyUrl(item.thumb_url, pageReferer);
+        const proxyThumbSrc = buildProxyUrl(item.thumb_url, pageReferer, "", true);
 
         card.innerHTML = `
             <div class="thumb-wrapper">
@@ -401,7 +421,7 @@ function renderNewVideos(videos, pageReferer) {
             ytdlp: "Platform Videosu",
         };
         const badgeLabel = typeLabels[vid.source_type] || "Video";
-        const thumbSrc = vid.thumb_url ? buildProxyUrl(vid.thumb_url, pageReferer) : "";
+        const thumbSrc = vid.thumb_url ? buildProxyUrl(vid.thumb_url, pageReferer, "", true) : "";
         const sizeInfo = vid.size_bytes ? ` • ${(vid.size_bytes / (1024 * 1024)).toFixed(1)} MB` : "";
 
         card.innerHTML = `

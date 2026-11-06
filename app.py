@@ -11,6 +11,7 @@ import zipfile
 import threading
 import subprocess
 from pathlib import Path
+from collections import OrderedDict
 from urllib.parse import urlparse, unquote
 from flask import Flask, render_template, request, jsonify, Response
 from PIL import Image
@@ -113,8 +114,19 @@ def save_config(cfg: dict):
 
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
-scraper_session = create_session()
+# Dedicated session for scraping HTML pages so thumbnail proxy requests never contend with or pollute page cookies
+page_scraper_session = create_session("chrome")
+# Dedicated session with large connection pool for concurrent thumbnail proxies & file downloads
+scraper_session = create_session("chrome")
 config = load_config()
+
+# Track current page scrape epoch so stale thumbnail proxy requests from previous pages abort immediately
+current_scrape_epoch = 0
+
+# In-memory LRU cache for thumbnail proxy responses so repeated forum assets/thumbs load in 0ms
+PROXY_CACHE = OrderedDict()
+PROXY_CACHE_LOCK = threading.Lock()
+PROXY_CACHE_MAX = 400
 
 
 def sanitize_folder_name(name: str) -> str:
@@ -182,11 +194,43 @@ def validate_image_bytes(data: bytes, content_type: str = ""):
         return False, None, ""
 
 
-def fetch_valid_image(target_url: str, referer: str = "", fallback_thumb_url: str = "", progress_cb=None):
+def fetch_valid_image(target_url: str, referer: str = "", fallback_thumb_url: str = "", progress_cb=None, is_proxy: bool = False):
     """
     Fetches an image from `target_url` with optional streaming progress callback.
     Returns (image_bytes, detected_ext, mime_type).
     """
+    req_timeout = 10 if is_proxy else 25
+
+    def _download_raw(url_to_get: str, ref_header: str):
+        headers = {
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        if ref_header:
+            headers["Referer"] = ref_header
+        resp = None
+        try:
+            resp = scraper_session.get(url_to_get, headers=headers, timeout=req_timeout, stream=True)
+            resp.raise_for_status()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            total_len = int(resp.headers.get("Content-Length") or 0)
+            final_resp_url = str(resp.url)
+
+            chunks = []
+            downloaded = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                downloaded += len(chunk)
+                if progress_cb:
+                    progress_cb(downloaded, total_len)
+            return b"".join(chunks), ctype, final_resp_url
+        except Exception:
+            return None, "", url_to_get
+        finally:
+            if resp:
+                resp.close()
+
     def try_single_url(url_to_get: str, ref: str, allow_html_resolve=True):
         if not url_to_get:
             return None, None, None
@@ -204,63 +248,46 @@ def fetch_valid_image(target_url: str, referer: str = "", fallback_thumb_url: st
             except Exception:
                 return None, None, None
 
-        headers = {
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        }
-        if ref:
-            headers["Referer"] = ref
+        parsed_u = urlparse(url_to_get)
+        self_ref = f"{parsed_u.scheme}://{parsed_u.netloc}/"
 
-        resp = None
-        try:
-            resp = scraper_session.get(url_to_get, headers=headers, timeout=25, stream=True)
-            resp.raise_for_status()
-        except Exception:
-            try:
-                if resp:
-                    resp.close()
-                parsed_u = urlparse(url_to_get)
-                self_ref = f"{parsed_u.scheme}://{parsed_u.netloc}/"
-                headers["Referer"] = self_ref
-                resp = scraper_session.get(url_to_get, headers=headers, timeout=25, stream=True)
-                resp.raise_for_status()
-            except Exception:
-                if resp:
-                    resp.close()
-                return None, None, None
+        # Try candidate referers in order: page referer -> image host self-origin -> no referer
+        candidate_refs = []
+        for r in (ref, self_ref, ""):
+            if r not in candidate_refs:
+                candidate_refs.append(r)
 
-        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        total_len = int(resp.headers.get("Content-Length") or 0)
+        last_html_bytes = None
+        last_ctype = ""
+        last_resp_url = url_to_get
 
-        chunks = []
-        downloaded = 0
-        try:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-                downloaded += len(chunk)
-                if progress_cb:
-                    progress_cb(downloaded, total_len)
-        finally:
-            resp.close()
-
-        content_bytes = b"".join(chunks)
-
-        # Check if we got a valid image directly
-        ok, ext, out_mime = validate_image_bytes(content_bytes, ctype)
-        if ok:
-            return content_bytes, ext, out_mime
+        for cand_ref in candidate_refs:
+            content_bytes, ctype, final_resp_url = _download_raw(url_to_get, cand_ref)
+            if not content_bytes:
+                continue
+            ok, ext, out_mime = validate_image_bytes(content_bytes, ctype)
+            if ok:
+                return content_bytes, ext, out_mime
+            if last_html_bytes is None:
+                last_html_bytes = content_bytes
+                last_ctype = ctype
+                last_resp_url = final_resp_url
+            # If it's a known image viewer HTML page (not a hotlink error on a .jpg URL), break early to resolve it
+            if allow_html_resolve and not any(parsed_u.path.lower().endswith(e) for e in IMAGE_EXTENSIONS):
+                break
 
         # If we received an HTML page (viewer page), extract the real image URL from inside it
-        if allow_html_resolve and ("text/html" in ctype or content_bytes[:100].lstrip().lower().startswith((b"<!doctype", b"<html"))):
-            html_str = content_bytes.decode("utf-8", errors="replace")
-            real_img_url = extract_real_image_from_viewer_html(html_str, str(resp.url))
+        if allow_html_resolve and last_html_bytes and (
+            "text/html" in last_ctype or last_html_bytes[:100].lstrip().lower().startswith((b"<!doctype", b"<html"))
+        ):
+            html_str = last_html_bytes.decode("utf-8", errors="replace")
+            real_img_url = extract_real_image_from_viewer_html(html_str, last_resp_url)
             if real_img_url and real_img_url != url_to_get:
-                return try_single_url(real_img_url, ref=str(resp.url), allow_html_resolve=False)
+                return try_single_url(real_img_url, ref=last_resp_url, allow_html_resolve=False)
 
         return None, None, None
 
-    img_bytes, ext, mime = try_single_url(target_url, referer, allow_html_resolve=True)
+    img_bytes, ext, mime = try_single_url(target_url, referer, allow_html_resolve=not is_proxy)
     if img_bytes:
         return img_bytes, ext, mime
 
@@ -938,13 +965,20 @@ def api_settings():
 
 @app.route("/api/scrape", methods=["POST"])
 def api_scrape():
+    global current_scrape_epoch
     body = request.get_json(silent=True) or {}
     target_url = (body.get("url") or "").strip()
+    referer = (body.get("referer") or "").strip()
+    append_mode = bool(body.get("append", False))
     if not target_url:
         return jsonify({"error": "Lütfen geçerli bir web sitesi adresi girin."}), 400
 
+    if not append_mode:
+        current_scrape_epoch += 1
+
     try:
-        result = scrape_page(target_url, session=scraper_session)
+        result = scrape_page(target_url, session=page_scraper_session, referer=referer)
+        result["scrape_epoch"] = current_scrape_epoch
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": f"Sayfa taranırken hata oluştu: {str(exc)}"}), 500
@@ -955,16 +989,51 @@ def api_proxy():
     img_url = request.args.get("url", "").strip()
     referer = request.args.get("referer", "").strip()
     fallback_thumb = request.args.get("thumb", "").strip()
+    sid_raw = request.args.get("sid", "").strip()
     if not img_url:
         return "Missing URL", 400
 
+    # Check if this thumbnail request belongs to an older page navigation and should be dropped immediately
+    if sid_raw.isdigit():
+        sid = int(sid_raw)
+        if 0 < sid < current_scrape_epoch:
+            return Response(b"", status=204)
+
+    # Check in-memory LRU cache first
+    with PROXY_CACHE_LOCK:
+        cached = PROXY_CACHE.get(img_url)
+        if cached:
+            PROXY_CACHE.move_to_end(img_url)
+            cached_bytes, cached_mime = cached
+            return Response(
+                cached_bytes,
+                status=200,
+                headers={
+                    "Content-Type": cached_mime,
+                    "Cache-Control": "public, max-age=3600",
+                },
+            )
+
     try:
-        img_bytes, _, mime = fetch_valid_image(img_url, referer=referer, fallback_thumb_url=fallback_thumb)
+        img_bytes, _, mime = fetch_valid_image(
+            img_url,
+            referer=referer,
+            fallback_thumb_url=fallback_thumb,
+            is_proxy=True,
+        )
+        out_mime = mime or "image/jpeg"
+        if len(img_bytes) <= 2 * 1024 * 1024:
+            with PROXY_CACHE_LOCK:
+                PROXY_CACHE[img_url] = (img_bytes, out_mime)
+                PROXY_CACHE.move_to_end(img_url)
+                while len(PROXY_CACHE) > PROXY_CACHE_MAX:
+                    PROXY_CACHE.popitem(last=False)
+
         return Response(
             img_bytes,
             status=200,
             headers={
-                "Content-Type": mime or "image/jpeg",
+                "Content-Type": out_mime,
                 "Cache-Control": "public, max-age=3600",
             },
         )

@@ -1,8 +1,11 @@
 import os
 import re
+import time
 import json
+import subprocess
 from urllib.parse import urljoin, urlparse, unquote
 import requests
+from requests.adapters import HTTPAdapter
 import cloudscraper
 from bs4 import BeautifulSoup
 
@@ -59,6 +62,25 @@ KNOWN_IMAGE_HOST_DOMAINS = (
     "imgur.com",
     "flickr.com",
     "wallhaven.cc",
+    "pixroute.com",
+    "imgadult.com",
+    "imgdrive.net",
+    "imgtaxi.com",
+    "imgwallet.com",
+    "pimpandhost.com",
+    "depic.me",
+    "keptarolo.hu",
+    "imageban.ru",
+    "radikal.host",
+    "abload.de",
+    "directupload.net",
+)
+
+# Common forum skin / UI chrome paths to skip so they never flood the proxy or grid
+FORUM_UI_CHROME_REGEX = re.compile(
+    r"/(images|styles|skins|themes)/([^/]+/)?(statusicon|buttons|smilies|reputation|misc|icons|ranks|rating|gradients|attach|editor)/"
+    r"|/(navbits_|collapse_thead|spacer\.gif|clear\.gif|blank\.gif|user_offline|user_online|post_old|post_new)",
+    re.IGNORECASE,
 )
 
 # Known video / streaming platforms & video hosts
@@ -125,15 +147,18 @@ KNOWN_CLOUD_HOST_DOMAINS = (
 )
 
 
-def create_session():
-    """Creates a CloudScraper session with browser-like headers."""
+def create_session(browser_name: str = "chrome"):
+    """Creates a CloudScraper session with browser-like headers and a high-capacity connection pool."""
     try:
         session = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            browser={"browser": browser_name, "platform": "windows", "mobile": False}
         )
     except Exception:
         session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=1)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     return session
 
 
@@ -883,25 +908,56 @@ def format_text_with_links_for_txt(title: str, source_url: str, text_body: str, 
     return "\n".join(lines)
 
 
+def clean_pagination_url(u: str) -> str:
+    """Strips volatile guest session tokens (like vBulletin s=32hex) from pagination URLs."""
+    if not u:
+        return u
+    cleaned = re.sub(r"([?&])s=[0-9a-fA-F]{32}(&|$)", lambda m: m.group(1) if m.group(2) == "&" else "", u)
+    cleaned = cleaned.rstrip("?&")
+    return cleaned
+
+
 def detect_pagination(soup: BeautifulSoup, current_url: str):
-    """Detects forum/gallery pagination controls."""
+    """Detects forum/gallery pagination controls accurately across vBulletin, XenForo, phpBB, and galleries."""
+    current_url_clean = clean_pagination_url(current_url)
+    current_host = urlparse(current_url_clean).netloc.lower().replace("www.", "")
+
     prev_url = None
     next_url = None
     pages_map = {}
+    detected_current_page = None
+    detected_total_pages = None
 
+    def is_valid_pagination_href(full_u: str) -> bool:
+        if not full_u or full_u.startswith(("javascript:", "mailto:", "tel:", "#")):
+            return False
+        parsed = urlparse(full_u)
+        if parsed.netloc.lower().replace("www.", "") != current_host:
+            return False
+        low = full_u.lower()
+        # Skip thread-jump or post action links that are not page navigation
+        if any(bad in low for bad in ("goto=nextnewest", "goto=nextoldest", "goto=newpost", "/reply", "/login", "/register", "do=newreply")):
+            return False
+        return True
+
+    # 1. Check <head> <link rel="prev/next">
     link_prev = soup.find(
         "link",
         attrs={"rel": lambda r: r and "prev" in (r if isinstance(r, list) else r.lower().split())},
     )
     if link_prev and link_prev.get("href"):
-        prev_url = urljoin(current_url, link_prev["href"].strip())
+        cand = clean_pagination_url(urljoin(current_url_clean, link_prev["href"].strip()))
+        if is_valid_pagination_href(cand):
+            prev_url = cand
 
     link_next = soup.find(
         "link",
         attrs={"rel": lambda r: r and "next" in (r if isinstance(r, list) else r.lower().split())},
     )
     if link_next and link_next.get("href"):
-        next_url = urljoin(current_url, link_next["href"].strip())
+        cand = clean_pagination_url(urljoin(current_url_clean, link_next["href"].strip()))
+        if is_valid_pagination_href(cand):
+            next_url = cand
 
     pagination_selectors = [
         ".pageNav", ".pagenav", ".pagination", ".pager", ".pages",
@@ -924,7 +980,9 @@ def detect_pagination(soup: BeautifulSoup, current_url: str):
         href = (a_tag.get("href") or "").strip()
         if not href or href.startswith(("javascript:", "#")):
             return
-        full_href = urljoin(current_url, href)
+        full_href = clean_pagination_url(urljoin(current_url_clean, href))
+        if not is_valid_pagination_href(full_href):
+            return
 
         rel = a_tag.get("rel")
         rel_str = " ".join(rel).lower() if isinstance(rel, list) else str(rel or "").lower()
@@ -934,22 +992,26 @@ def detect_pagination(soup: BeautifulSoup, current_url: str):
         aria = (a_tag.get("aria-label") or "").lower()
         combined = f"{text} {title} {aria} {classes}"
 
-        if not prev_url:
+        # Skip "First Page" / "Last Page" links when looking for immediate Prev / Next
+        is_first_link = "start" in rel_str or "first" in combined or "ilk sayfa" in combined or text in ("«", "« first", "first", "ilk")
+        is_last_link = "last" in rel_str or "last" in combined or "son sayfa" in combined or text in ("»", "last »", "last", "son")
+
+        if not prev_url and not is_first_link:
             if (
                 "prev" in rel_str
                 or "pagenav-jump--prev" in classes
-                or any(k in combined for k in ("önceki", "onceki", "previous", "« önceki", "‹ önceki", "prev page"))
-                or (in_pagination_container and text in ("‹", "«", "<", "prev", "önceki"))
+                or re.search(r"\b(önceki|onceki|previous|prev\s+page)\b", combined)
+                or (in_pagination_container and text in ("‹", "<", "prev", "önceki", "« önceki", "‹ önceki"))
             ):
                 prev_url = full_href
                 return
 
-        if not next_url:
+        if not next_url and not is_last_link:
             if (
                 "next" in rel_str
                 or "pagenav-jump--next" in classes
-                or any(k in combined for k in ("sonraki", "next page", "sonraki »", "sonraki ›", "ileri"))
-                or (in_pagination_container and text in ("›", "»", ">", "next", "sonraki"))
+                or re.search(r"\b(sonraki|next\s+page)\b", combined)
+                or (in_pagination_container and text in ("›", ">", "next", "sonraki", "sonraki »", "sonraki ›", "ileri"))
             ):
                 next_url = full_href
                 return
@@ -970,54 +1032,89 @@ def detect_pagination(soup: BeautifulSoup, current_url: str):
                     }
 
     for container in pagination_containers:
+        # Check for "Page X of Y" or "Sayfa X / Y" text inside container
+        if detected_current_page is None:
+            container_txt = container.get_text(" ", strip=True)
+            m_xy = re.search(r"(?:page|sayfa)\s+(\d+)\s+(?:of|/)\s+(\d+)", container_txt, re.IGNORECASE)
+            if m_xy:
+                detected_current_page = int(m_xy.group(1))
+                detected_total_pages = int(m_xy.group(2))
+
         for a_tag in container.find_all("a", href=True):
             inspect_anchor(a_tag, in_pagination_container=True)
-        for el in container.find_all(["span", "strong", "em", "li", "a"]):
+
+        for el in container.find_all(["span", "strong", "b", "em", "li", "a"]):
+            txt = el.get_text(strip=True)
+            if not txt.isdigit():
+                continue
+            num = int(txt)
+            if not (1 <= num <= 50000):
+                continue
+
             el_classes = " ".join(el.get("class", [])).lower()
+            # In vBulletin and many forums, the current page inside .pagenav is wrapped in <strong>66</strong> without an <a> parent
+            is_standalone_strong = el.name in ("strong", "b") and el.find_parent("a") is None
             is_curr = (
-                any(c in el_classes for c in ("current", "active", "selected", "pagenav-page--current"))
+                is_standalone_strong
+                or any(c in el_classes for c in ("current", "active", "selected", "pagenav-page--current"))
                 or el.get("aria-current") == "page"
             )
             if is_curr:
-                txt = el.get_text(strip=True)
-                if txt.isdigit():
-                    num = int(txt)
-                    pages_map[num] = {
-                        "number": num,
-                        "label": str(num),
-                        "url": current_url,
-                        "is_current": True,
-                    }
+                detected_current_page = detected_current_page or num
+                pages_map[num] = {
+                    "number": num,
+                    "label": str(num),
+                    "url": current_url_clean,
+                    "is_current": True,
+                }
 
+    # Only check <a rel="next"> or <a rel="prev"> outside containers if no container found them
     if not prev_url or not next_url:
-        for a_tag in soup.find_all("a", href=True):
+        for a_tag in soup.find_all("a", rel=True, href=True):
             inspect_anchor(a_tag, in_pagination_container=False)
 
-    current_page = None
+    current_page = detected_current_page
     for num, info in pages_map.items():
-        if info["is_current"] or info["url"].rstrip("/") == current_url.rstrip("/"):
+        if info["is_current"] or info["url"].rstrip("/") == current_url_clean.rstrip("/"):
             info["is_current"] = True
-            current_page = num
+            current_page = current_page or num
 
     if current_page is None:
         url_page_match = re.search(
-            r"(?:/page[-/]|/p|[?&](?:page|p|sayfa)=)(\d+)\b", current_url, re.IGNORECASE
+            r"(?:/page[-/]|[-/]p|[?&](?:page|p|sayfa)=)(\d+)(?=[-/._?&]|$)",
+            current_url_clean,
+            re.IGNORECASE,
         )
         if url_page_match:
             current_page = int(url_page_match.group(1))
         elif pages_map or next_url:
             current_page = 1
 
-    if current_page and current_page not in pages_map and (pages_map or prev_url or next_url):
-        pages_map[current_page] = {
-            "number": current_page,
-            "label": str(current_page),
-            "url": current_url,
-            "is_current": True,
-        }
+    # Ensure only the actual current_page is marked is_current=True
+    if current_page:
+        for num, info in pages_map.items():
+            info["is_current"] = (num == current_page)
+        if current_page not in pages_map and (pages_map or prev_url or next_url):
+            pages_map[current_page] = {
+                "number": current_page,
+                "label": str(current_page),
+                "url": current_url_clean,
+                "is_current": True,
+            }
+
+    # Deterministically prefer exact sequential page URLs from pages_map when available
+    if current_page:
+        if (current_page + 1) in pages_map:
+            next_url = pages_map[current_page + 1]["url"]
+        if (current_page - 1) in pages_map:
+            prev_url = pages_map[current_page - 1]["url"]
+        if current_page <= 1:
+            prev_url = None
+        if detected_total_pages and current_page >= detected_total_pages:
+            next_url = None
 
     sorted_pages = [pages_map[k] for k in sorted(pages_map.keys())]
-    page_url_template = detect_page_url_template(current_url, sorted_pages, next_url, prev_url)
+    page_url_template = detect_page_url_template(current_url_clean, sorted_pages, next_url, prev_url)
 
     return {
         "has_pagination": bool(prev_url or next_url or len(sorted_pages) > 1),
@@ -1030,14 +1127,15 @@ def detect_pagination(soup: BeautifulSoup, current_url: str):
 
 
 def detect_page_url_template(current_url: str, pages: list, next_url: str, prev_url: str):
-    sample_urls = [p["url"] for p in pages if p["url"] != current_url]
+    sample_urls = [current_url]
     if next_url:
         sample_urls.append(next_url)
     if prev_url:
         sample_urls.append(prev_url)
-    sample_urls.append(current_url)
+    sample_urls.extend(p["url"] for p in pages if p["url"] != current_url)
 
     patterns = [
+        (r"(-p)(\d+)(-|\.)", r"\g<1>{page}\g<3>"),
         (r"(/page-)(\d+)(?=/|$|\?)", r"\g<1>{page}"),
         (r"(/page/)(\d+)(?=/|$|\?)", r"\g<1>{page}"),
         (r"([?&](?:page|sayfa|p)=)(\d+)\b", r"\g<1>{page}"),
@@ -1049,19 +1147,147 @@ def detect_page_url_template(current_url: str, pages: list, next_url: str, prev_
     return None
 
 
-def scrape_page(url: str, session=None):
+def _fetch_page_resilient(url: str, session=None, referer: str = ""):
+    """
+    Fetches a URL with a 4-stage Anti-403 / Anti-Rate-Limit recovery strategy:
+    1. Primary CloudScraper session with browser navigation headers & Referer.
+    2. Fresh CloudScraper session with rotated browser profile (Firefox/Chrome) & domain warm-up.
+    3. HTTP/2 client (httpx) with modern headers.
+    4. Windows native curl.exe (Schannel TLS stack) fallback to bypass OpenSSL JA3 blocks.
+    Returns (final_url, content_type, content_length, raw_bytes, encoding).
+    """
+    sess = session or create_session()
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}/"
+
+    nav_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if referer and parsed.netloc in referer else "none",
+        "Sec-Fetch-User": "?1",
+    }
+    if referer:
+        nav_headers["Referer"] = referer
+    else:
+        nav_headers["Referer"] = origin
+
+    last_exc = None
+
+    # Stage 1: Primary session
+    resp = None
+    try:
+        resp = sess.get(url, headers=nav_headers, timeout=25, stream=True)
+        if resp.status_code not in (403, 429, 503):
+            resp.raise_for_status()
+            return _consume_response(resp)
+        last_exc = requests.HTTPError(f"{resp.status_code} Client Error for url: {url}", response=resp)
+        resp.close()
+    except Exception as exc:
+        if resp:
+            resp.close()
+        last_exc = exc
+
+    # Stage 2: Fresh CloudScraper session with Firefox profile + origin cookie warm-up
+    time.sleep(0.4)
+    resp2 = None
+    try:
+        fresh_sess = create_session(browser_name="firefox")
+        try:
+            fresh_sess.get(origin, timeout=10).close()
+        except Exception:
+            pass
+        resp2 = fresh_sess.get(url, headers=nav_headers, timeout=25, stream=True)
+        if resp2.status_code not in (403, 429, 503):
+            resp2.raise_for_status()
+            # Copy working cookies back to primary session
+            sess.cookies.update(fresh_sess.cookies)
+            return _consume_response(resp2)
+        resp2.close()
+    except Exception as exc:
+        if resp2:
+            resp2.close()
+        last_exc = exc
+
+    # Stage 3: Try httpx (HTTP/2) if available
+    try:
+        import httpx
+        with httpx.Client(http2=True, follow_redirects=True, verify=False, timeout=20.0) as client:
+            h_headers = dict(DEFAULT_HEADERS)
+            h_headers.update(nav_headers)
+            h_resp = client.get(url, headers=h_headers)
+            if h_resp.status_code < 400:
+                ctype = (h_resp.headers.get("content-type") or "").lower()
+                clen = int(h_resp.headers.get("content-length") or len(h_resp.content))
+                return str(h_resp.url), ctype, clen, h_resp.content, h_resp.encoding or "utf-8"
+    except Exception:
+        pass
+
+    # Stage 4: Windows native curl.exe (Schannel TLS fingerprint bypasses OpenSSL 403 blocks)
+    try:
+        no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        curl_cmd = [
+            "curl.exe", "-s", "-L", "--compressed", "--max-time", "20",
+            "-A", DEFAULT_HEADERS["User-Agent"],
+            "-e", referer or origin,
+            "-w", "\n__FINAL_URL__:%{url_effective}\n__STATUS__:%{http_code}\n__CTYPE__:%{content_type}",
+            url,
+        ]
+        proc = subprocess.run(curl_cmd, capture_output=True, timeout=22, creationflags=no_win)
+        if proc.returncode == 0 and proc.stdout:
+            out_bytes = proc.stdout
+            marker_idx = out_bytes.rfind(b"\n__FINAL_URL__:")
+            if marker_idx != -1:
+                body_bytes = out_bytes[:marker_idx]
+                meta_text = out_bytes[marker_idx:].decode("utf-8", errors="replace")
+                m_url = re.search(r"__FINAL_URL__:(\S+)", meta_text)
+                m_code = re.search(r"__STATUS__:(\d+)", meta_text)
+                m_ctype = re.search(r"__CTYPE__:([^\r\n]+)", meta_text)
+                status_code = int(m_code.group(1)) if m_code else 200
+                if 200 <= status_code < 400 and len(body_bytes) > 64:
+                    eff_url = m_url.group(1).strip() if m_url else url
+                    ctype = (m_ctype.group(1).strip() if m_ctype else "text/html").lower()
+                    return eff_url, ctype, len(body_bytes), body_bytes, "utf-8"
+    except Exception:
+        pass
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Sayfaya erişilemedi: {url}")
+
+
+def _consume_response(resp) -> tuple:
+    try:
+        final_url = str(resp.url)
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        content_length = int(resp.headers.get("Content-Length") or 0)
+        encoding = resp.encoding or "utf-8"
+
+        if content_type.startswith(("image/", "video/")) or any(
+            urlparse(final_url).path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS
+        ):
+            return final_url, content_type, content_length, b"", encoding
+
+        if content_type.startswith("text/plain"):
+            raw_bytes = resp.raw.read(2 * 1024 * 1024, decode_content=True)
+            return final_url, content_type, content_length, raw_bytes, encoding
+
+        raw_bytes = resp.content
+        return final_url, content_type, content_length, raw_bytes, encoding
+    finally:
+        resp.close()
+
+
+def scrape_page(url: str, session=None, referer: str = ""):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    sess = session or create_session()
-
-    # Use stream=True first so if the user pastes a direct link to a 500MB video/file, we don't load 500MB into RAM during scrape!
-    resp = sess.get(url, timeout=25, stream=True)
-    resp.raise_for_status()
-
-    final_url = str(resp.url)
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-    content_length = int(resp.headers.get("Content-Length") or 0)
+    url = clean_pagination_url(url)
+    final_url, content_type, content_length, raw_bytes, encoding = _fetch_page_resilient(
+        url, session=session, referer=referer
+    )
 
     empty_pagination = {
         "has_pagination": False,
@@ -1074,7 +1300,6 @@ def scrape_page(url: str, session=None):
 
     # Case 1: Direct Image URL
     if content_type.startswith("image/"):
-        resp.close()
         fname = extract_filename(final_url, 1)
         return {
             "page_title": fname,
@@ -1099,7 +1324,6 @@ def scrape_page(url: str, session=None):
 
     # Case 2: Direct Video Stream / File URL
     if content_type.startswith("video/") or any(urlparse(final_url).path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-        resp.close()
         fname = extract_video_filename(final_url, 1)
         return {
             "page_title": fname,
@@ -1127,9 +1351,7 @@ def scrape_page(url: str, session=None):
 
     # Case 3: Plain text document URL
     if content_type.startswith("text/plain"):
-        raw_bytes = resp.raw.read(2 * 1024 * 1024, decode_content=True)
-        resp.close()
-        text_content = raw_bytes.decode("utf-8", errors="replace")
+        text_content = raw_bytes.decode(encoding, errors="replace")
         fname = unquote(urlparse(final_url).path.split("/")[-1]) or "metin.txt"
         if not fname.lower().endswith(".txt"):
             fname += ".txt"
@@ -1156,10 +1378,8 @@ def scrape_page(url: str, session=None):
             "pagination": empty_pagination,
         }
 
-    # Read HTML content
-    html_bytes = resp.content
-    resp.close()
-    html_text = html_bytes.decode(resp.encoding or "utf-8", errors="replace")
+    # Parse HTML content
+    html_text = raw_bytes.decode(encoding, errors="replace")
 
     soup = BeautifulSoup(html_text, "lxml")
     page_title = (
@@ -1178,6 +1398,10 @@ def scrape_page(url: str, session=None):
         full_u = full_u or thumb_u
 
         if full_u.startswith(("data:image/gif", "data:image/svg")) and thumb_u == full_u:
+            return
+
+        # Skip obvious forum skin/chrome icons (reply/quote buttons, status icons, smilies, reputation bars)
+        if thumb_u == full_u and FORUM_UI_CHROME_REGEX.search(thumb_u):
             return
 
         norm_key = (full_u.split("#")[0], thumb_u.split("#")[0])
