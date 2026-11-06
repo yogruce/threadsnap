@@ -20,6 +20,8 @@ from bs4 import BeautifulSoup
 from scraper import (
     create_session,
     scrape_page,
+    register_browser_fetcher,
+    is_cloudflare_challenge,
     extract_real_image_from_viewer_html,
     extract_texts_and_links,
     format_text_with_links_for_txt,
@@ -208,12 +210,16 @@ def fetch_valid_image(target_url: str, referer: str = "", fallback_thumb_url: st
         if ref_header:
             headers["Referer"] = ref_header
         resp = None
+        use_stream = bool(progress_cb is not None)
         try:
-            resp = scraper_session.get(url_to_get, headers=headers, timeout=req_timeout, stream=True)
+            resp = scraper_session.get(url_to_get, headers=headers, timeout=req_timeout, stream=use_stream)
             resp.raise_for_status()
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             total_len = int(resp.headers.get("Content-Length") or 0)
             final_resp_url = str(resp.url)
+
+            if not use_stream:
+                return resp.content or b"", ctype, final_resp_url
 
             chunks = []
             downloaded = 0
@@ -1434,19 +1440,116 @@ def start_flask(port: int):
 
 
 def launch_desktop_window(url: str):
-    from PyQt6.QtCore import QUrl
+    from PyQt6.QtCore import QUrl, QObject, QTimer, pyqtSignal, Qt
     from PyQt6.QtGui import QColor
     from PyQt6.QtWidgets import QApplication, QMainWindow
+    from PyQt6.QtWebEngineCore import QWebEngineProfile
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("Medya, Video, Metin & Forum İndirici")
+
+    # Persist browser cookies (including cf_clearance) across runs
+    profile_dir = BASE_DIR / ".browser_profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    default_profile = QWebEngineProfile.defaultProfile()
+    default_profile.setPersistentStoragePath(str(profile_dir))
+    default_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+
+    captured_cookies = {}
+
+    def _on_cookie_added(cookie):
+        try:
+            name = bytes(cookie.name()).decode("utf-8", errors="ignore")
+            val = bytes(cookie.value()).decode("utf-8", errors="ignore")
+            domain = cookie.domain().lstrip(".")
+            if name and val:
+                captured_cookies[name] = val
+                try:
+                    page_scraper_session.cookies.set(name, val, domain=domain)
+                    scraper_session.cookies.set(name, val, domain=domain)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    default_profile.cookieStore().cookieAdded.connect(_on_cookie_added)
 
     main_win = QMainWindow()
     main_win.setWindowTitle("ImgCatcher Pro — Görsel, Video, Metin & Link İndirici")
     main_win.resize(1340, 860)
     main_win.setMinimumSize(960, 640)
     main_win.setStyleSheet("background-color: #0f172a;")
+
+    class CloudflareSolverBridge(QObject):
+        solve_requested = pyqtSignal(str, str, object)
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.solve_requested.connect(self._handle_solve_on_main_thread)
+
+        def _handle_solve_on_main_thread(self, target_url: str, referer: str, state_box: dict):
+            cf_win = QMainWindow(main_win)
+            cf_win.setWindowTitle("Cloudflare Güvenlik Doğrulaması Geçiliyor...")
+            cf_win.resize(900, 620)
+            cf_win.setStyleSheet("background-color: #0f172a;")
+
+            cf_view = QWebEngineView(cf_win)
+            cf_win.setCentralWidget(cf_view)
+
+            poll_timer = QTimer(cf_win)
+            poll_timer.setInterval(700)
+            start_ts = time.time()
+            finished_flag = [False]
+
+            def finish_with(html_str: str):
+                if finished_flag[0]:
+                    return
+                finished_flag[0] = True
+                poll_timer.stop()
+                state_box["html"] = html_str.encode("utf-8", errors="replace") if html_str else b""
+                state_box["final_url"] = cf_view.url().toString() or target_url
+                state_box["cookies"] = dict(captured_cookies)
+                cf_win.close()
+                cf_win.deleteLater()
+                state_box["event"].set()
+
+            def check_html(html_str: str):
+                if finished_flag[0]:
+                    return
+                raw_b = (html_str or "").encode("utf-8", errors="replace")
+                elapsed = time.time() - start_ts
+                if len(raw_b) > 600 and not is_cloudflare_challenge(200, raw_b):
+                    finish_with(html_str)
+                elif elapsed > 2.5 and not cf_win.isVisible():
+                    # Show window if interactive Turnstile challenge requires visual rendering or click
+                    cf_win.show()
+                    cf_win.raise_()
+                    cf_win.activateWindow()
+                elif elapsed > 28.0:
+                    finish_with(html_str)
+
+            def on_poll():
+                if finished_flag[0]:
+                    return
+                cf_view.page().toHtml(check_html)
+
+            poll_timer.timeout.connect(on_poll)
+            cf_view.loadFinished.connect(lambda _: on_poll())
+            poll_timer.start()
+            cf_view.setUrl(QUrl(target_url))
+
+    cf_bridge = CloudflareSolverBridge(main_win)
+
+    def fetch_via_qt_browser(target_url: str, referer: str = "") -> dict | None:
+        state_box = {"event": threading.Event(), "html": b"", "final_url": target_url, "cookies": {}}
+        cf_bridge.solve_requested.emit(target_url, referer, state_box)
+        state_box["event"].wait(timeout=30.0)
+        if state_box["html"]:
+            return state_box
+        return None
+
+    register_browser_fetcher(fetch_via_qt_browser)
 
     browser = QWebEngineView(main_win)
     browser.page().setBackgroundColor(QColor("#0f172a"))

@@ -330,6 +330,7 @@ function renderNewImages(items, pageReferer) {
             card.classList.add("downloaded");
         }
 
+        const directThumbSrc = item.thumb_url || "";
         const proxyThumbSrc = buildProxyUrl(item.thumb_url, pageReferer, "", true);
 
         card.innerHTML = `
@@ -341,7 +342,7 @@ function renderNewImages(items, pageReferer) {
                     </div>
                     <button type="button" class="card-preview-btn" title="Tam Ekran Önizle (Büyüteç)">🔍</button>
                 </div>
-                <img src="${proxyThumbSrc}" alt="${escapeHtml(item.alt || item.filename)}" loading="lazy" />
+                <img src="${directThumbSrc}" referrerpolicy="no-referrer" alt="${escapeHtml(item.alt || item.filename)}" loading="lazy" />
                 <div class="download-hint-overlay">
                     <span class="hint-pill">${state.downloadedUrls.has(item.full_url) ? "✓ Tekrar İndir" : "⬇ Tıkla & İndir"}</span>
                 </div>
@@ -366,9 +367,10 @@ function renderNewImages(items, pageReferer) {
         });
 
         imgEl.addEventListener("error", () => {
-            if (!imgEl.dataset.retriedDirect) {
-                imgEl.dataset.retriedDirect = "1";
-                imgEl.src = item.thumb_url;
+            if (!imgEl.dataset.retriedProxy) {
+                imgEl.dataset.retriedProxy = "1";
+                imgEl.removeAttribute("referrerpolicy");
+                imgEl.src = proxyThumbSrc;
             } else {
                 item.loadFailed = true;
                 card.classList.add("hidden");

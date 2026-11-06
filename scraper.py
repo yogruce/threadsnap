@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import json
 import subprocess
@@ -8,6 +9,32 @@ import requests
 from requests.adapters import HTTPAdapter
 import cloudscraper
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "curl_cffi", "--quiet"],
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        from curl_cffi import requests as curl_requests
+        HAS_CURL_CFFI = True
+    except Exception:
+        curl_requests = None
+        HAS_CURL_CFFI = False
+
+# Optional real-browser (QtWebEngine / Chromium) callback registered by app.py for solving interactive/JS Cloudflare challenges
+_BROWSER_FETCH_CALLBACK = None
+
+
+def register_browser_fetcher(callback_fn):
+    """Registers a callable `callback_fn(url, referer) -> dict(html, final_url, cookies, user_agent)`."""
+    global _BROWSER_FETCH_CALLBACK
+    _BROWSER_FETCH_CALLBACK = callback_fn
+
 
 
 DEFAULT_HEADERS = {
@@ -147,11 +174,26 @@ KNOWN_CLOUD_HOST_DOMAINS = (
 )
 
 
-def create_session(browser_name: str = "chrome"):
-    """Creates a CloudScraper session with browser-like headers and a high-capacity connection pool."""
+def create_session(browser_name: str = "chrome", prefer_curl_cffi: bool = True):
+    """
+    Creates a session that impersonates a real Chrome/Firefox browser TLS (JA3/JA4) & HTTP/2 fingerprint
+    via curl_cffi so Cloudflare Bot Fight Mode / WAF does not block multi-page requests with 403 Forbidden.
+    Falls back to CloudScraper if curl_cffi is unavailable.
+    """
+    if prefer_curl_cffi and HAS_CURL_CFFI:
+        impersonate_target = "chrome" if browser_name not in ("firefox", "safari", "edge") else browser_name
+        try:
+            session = curl_requests.Session(impersonate=impersonate_target)
+            session.headers.update({
+                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+            })
+            return session
+        except Exception:
+            pass
+
     try:
         session = cloudscraper.create_scraper(
-            browser={"browser": browser_name, "platform": "windows", "mobile": False}
+            browser={"browser": browser_name if browser_name in ("chrome", "firefox") else "chrome", "platform": "windows", "mobile": False}
         )
     except Exception:
         session = requests.Session()
@@ -1147,95 +1189,198 @@ def detect_page_url_template(current_url: str, pages: list, next_url: str, prev_
     return None
 
 
+CLOUDFLARE_CHALLENGE_MARKERS = (
+    b"<title>just a moment...",
+    b"<title>bir dakika l",
+    b"<title>attention required! | cloudflare",
+    b"cf-browser-verification",
+    b"__cf_chl_opt",
+    b"/cdn-cgi/challenge-platform/",
+    b"cf-challenge-running",
+    b"<title>ddos-guard</title>",
+    b"checking your browser before accessing",
+)
+
+
+def is_cloudflare_challenge(status_code: int, raw_bytes: bytes) -> bool:
+    """Detects whether an HTTP response is a Cloudflare / DDoS-Guard block or JS/Turnstile challenge page."""
+    if not raw_bytes:
+        return status_code in (403, 429, 503)
+    head_lower = raw_bytes[:16384].lower()
+    if any(marker in head_lower for marker in CLOUDFLARE_CHALLENGE_MARKERS):
+        return True
+    if status_code in (403, 429, 503) and (b"cloudflare" in head_lower or b"cf-ray" in head_lower or len(raw_bytes) < 25000):
+        return True
+    return False
+
+
+def _inject_cookies_into_session(sess, cookies_dict: dict, domain: str = ""):
+    if not cookies_dict or not sess:
+        return
+    for k, v in cookies_dict.items():
+        try:
+            if domain:
+                sess.cookies.set(k, v, domain=domain)
+            else:
+                sess.cookies.set(k, v)
+        except Exception:
+            try:
+                sess.cookies[k] = v
+            except Exception:
+                pass
+
+
+def _fetch_via_selenium_fallback(url: str, referer: str = "") -> dict | None:
+    """
+    Fallback real Chrome browser via Selenium when running outside QtWebEngine or if QtWebEngine needs help.
+    Waits for Cloudflare challenge to pass and returns {'html': bytes, 'final_url': str, 'cookies': dict, 'user_agent': str}.
+    """
+    driver = None
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1280,800")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+
+        driver = webdriver.Chrome(options=opts)
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+        )
+        driver.set_page_load_timeout(25)
+        driver.get(url)
+
+        for _ in range(16):
+            html_str = driver.page_source or ""
+            raw_b = html_str.encode("utf-8", errors="replace")
+            if not is_cloudflare_challenge(200, raw_b) and len(raw_b) > 500:
+                cookies = {c["name"]: c["value"] for c in driver.get_cookies() if "name" in c and "value" in c}
+                ua = driver.execute_script("return navigator.userAgent;") or DEFAULT_HEADERS["User-Agent"]
+                return {
+                    "html": raw_b,
+                    "final_url": driver.current_url or url,
+                    "cookies": cookies,
+                    "user_agent": ua,
+                }
+            time.sleep(0.75)
+    except Exception:
+        pass
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    return None
+
+
 def _fetch_page_resilient(url: str, session=None, referer: str = ""):
     """
-    Fetches a URL with a 4-stage Anti-403 / Anti-Rate-Limit recovery strategy:
-    1. Primary CloudScraper session with browser navigation headers & Referer.
-    2. Fresh CloudScraper session with rotated browser profile (Firefox/Chrome) & domain warm-up.
-    3. HTTP/2 client (httpx) with modern headers.
-    4. Windows native curl.exe (Schannel TLS stack) fallback to bypass OpenSSL JA3 blocks.
+    Fetches a URL with a 5-stage Anti-Cloudflare / Anti-403 recovery strategy:
+    1. Primary curl_cffi Chrome TLS/HTTP2 impersonation session (keeps genuine Chrome Sec-CH-UA & JA3/JA4 fingerprint).
+    2. Fresh curl_cffi rotated browser profiles (chrome, firefox, safari) with origin cookie warm-up.
+    3. CloudScraper + HTTP/2 httpx fallback.
+    4. Windows native curl.exe (Schannel TLS stack).
+    5. Real Chromium Browser engine (QtWebEngine in-app Chromium or Selenium Chrome) that executes Cloudflare JS/Turnstile
+       challenges and injects `cf_clearance` cookies back into the primary session for fast subsequent pages.
     Returns (final_url, content_type, content_length, raw_bytes, encoding).
     """
     sess = session or create_session()
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}/"
+    same_site = bool(referer and parsed.netloc and parsed.netloc.lower() in referer.lower())
 
+    # Minimal navigation headers that DO NOT clobber curl_cffi's native Chrome User-Agent / Sec-CH-UA pair
     nav_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin" if referer and parsed.netloc in referer else "none",
+        "Sec-Fetch-Site": "same-origin" if same_site else "none",
         "Sec-Fetch-User": "?1",
+        "Referer": referer if referer else origin,
     }
-    if referer:
-        nav_headers["Referer"] = referer
-    else:
-        nav_headers["Referer"] = origin
 
+    is_media_url = any(parsed.path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
     last_exc = None
 
-    # Stage 1: Primary session
+    # Stage 1: Primary session (curl_cffi Chrome TLS impersonation)
     resp = None
     try:
-        resp = sess.get(url, headers=nav_headers, timeout=25, stream=True)
+        resp = sess.get(url, headers=nav_headers, timeout=20, stream=is_media_url)
         if resp.status_code not in (403, 429, 503):
             resp.raise_for_status()
-            return _consume_response(resp)
-        last_exc = requests.HTTPError(f"{resp.status_code} Client Error for url: {url}", response=resp)
+            final_url, ctype, clen, raw_bytes, enc = _consume_response(resp, is_stream=is_media_url)
+            if not is_cloudflare_challenge(200, raw_bytes):
+                return final_url, ctype, clen, raw_bytes, enc
+        last_exc = requests.HTTPError(f"{resp.status_code} Client Error: Forbidden for url: {url}", response=resp)
         resp.close()
     except Exception as exc:
         if resp:
             resp.close()
         last_exc = exc
 
-    # Stage 2: Fresh CloudScraper session with Firefox profile + origin cookie warm-up
-    time.sleep(0.4)
-    resp2 = None
-    try:
-        fresh_sess = create_session(browser_name="firefox")
+    # Stage 2: Rotated curl_cffi TLS profiles (firefox, safari, chrome) with origin warm-up
+    if HAS_CURL_CFFI:
+        for profile in ("firefox", "safari", "chrome"):
+            time.sleep(0.25)
+            resp_cffi = None
+            try:
+                fresh_cffi = curl_requests.Session(impersonate=profile)
+                try:
+                    fresh_cffi.get(origin, timeout=8).close()
+                except Exception:
+                    pass
+                resp_cffi = fresh_cffi.get(url, headers=nav_headers, timeout=20, stream=is_media_url)
+                if resp_cffi.status_code not in (403, 429, 503):
+                    resp_cffi.raise_for_status()
+                    final_url, ctype, clen, raw_bytes, enc = _consume_response(resp_cffi, is_stream=is_media_url)
+                    if not is_cloudflare_challenge(200, raw_bytes):
+                        try:
+                            sess.cookies.update(fresh_cffi.cookies)
+                        except Exception:
+                            pass
+                        return final_url, ctype, clen, raw_bytes, enc
+                resp_cffi.close()
+            except Exception as exc:
+                if resp_cffi:
+                    resp_cffi.close()
+                last_exc = exc
+
+    # Stage 3: CloudScraper (Firefox/Chrome JS challenge solver)
+    for cs_browser in ("firefox", "chrome"):
+        resp_cs = None
         try:
-            fresh_sess.get(origin, timeout=10).close()
+            cs_sess = create_session(browser_name=cs_browser, prefer_curl_cffi=False)
+            resp_cs = cs_sess.get(url, headers=nav_headers, timeout=20, stream=is_media_url)
+            if resp_cs.status_code not in (403, 429, 503):
+                resp_cs.raise_for_status()
+                final_url, ctype, clen, raw_bytes, enc = _consume_response(resp_cs, is_stream=is_media_url)
+                if not is_cloudflare_challenge(200, raw_bytes):
+                    return final_url, ctype, clen, raw_bytes, enc
+            resp_cs.close()
         except Exception:
-            pass
-        resp2 = fresh_sess.get(url, headers=nav_headers, timeout=25, stream=True)
-        if resp2.status_code not in (403, 429, 503):
-            resp2.raise_for_status()
-            # Copy working cookies back to primary session
-            sess.cookies.update(fresh_sess.cookies)
-            return _consume_response(resp2)
-        resp2.close()
-    except Exception as exc:
-        if resp2:
-            resp2.close()
-        last_exc = exc
+            if resp_cs:
+                resp_cs.close()
 
-    # Stage 3: Try httpx (HTTP/2) if available
-    try:
-        import httpx
-        with httpx.Client(http2=True, follow_redirects=True, verify=False, timeout=20.0) as client:
-            h_headers = dict(DEFAULT_HEADERS)
-            h_headers.update(nav_headers)
-            h_resp = client.get(url, headers=h_headers)
-            if h_resp.status_code < 400:
-                ctype = (h_resp.headers.get("content-type") or "").lower()
-                clen = int(h_resp.headers.get("content-length") or len(h_resp.content))
-                return str(h_resp.url), ctype, clen, h_resp.content, h_resp.encoding or "utf-8"
-    except Exception:
-        pass
-
-    # Stage 4: Windows native curl.exe (Schannel TLS fingerprint bypasses OpenSSL 403 blocks)
+    # Stage 4: Windows native curl.exe (Schannel TLS stack)
     try:
         no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         curl_cmd = [
-            "curl.exe", "-s", "-L", "--compressed", "--max-time", "20",
+            "curl.exe", "-s", "-L", "--compressed", "--max-time", "18",
             "-A", DEFAULT_HEADERS["User-Agent"],
             "-e", referer or origin,
             "-w", "\n__FINAL_URL__:%{url_effective}\n__STATUS__:%{http_code}\n__CTYPE__:%{content_type}",
             url,
         ]
-        proc = subprocess.run(curl_cmd, capture_output=True, timeout=22, creationflags=no_win)
+        proc = subprocess.run(curl_cmd, capture_output=True, timeout=20, creationflags=no_win)
         if proc.returncode == 0 and proc.stdout:
             out_bytes = proc.stdout
             marker_idx = out_bytes.rfind(b"\n__FINAL_URL__:")
@@ -1246,35 +1391,67 @@ def _fetch_page_resilient(url: str, session=None, referer: str = ""):
                 m_code = re.search(r"__STATUS__:(\d+)", meta_text)
                 m_ctype = re.search(r"__CTYPE__:([^\r\n]+)", meta_text)
                 status_code = int(m_code.group(1)) if m_code else 200
-                if 200 <= status_code < 400 and len(body_bytes) > 64:
+                if 200 <= status_code < 400 and len(body_bytes) > 64 and not is_cloudflare_challenge(status_code, body_bytes):
                     eff_url = m_url.group(1).strip() if m_url else url
                     ctype = (m_ctype.group(1).strip() if m_ctype else "text/html").lower()
                     return eff_url, ctype, len(body_bytes), body_bytes, "utf-8"
     except Exception:
         pass
 
+    # Stage 5: Real Chromium Browser Engine (In-app QtWebEngine or Selenium Chrome) for active Cloudflare JS/Turnstile challenges
+    browser_res = None
+    if _BROWSER_FETCH_CALLBACK is not None:
+        try:
+            browser_res = _BROWSER_FETCH_CALLBACK(url, referer or origin)
+        except Exception:
+            browser_res = None
+
+    if not browser_res:
+        browser_res = _fetch_via_selenium_fallback(url, referer or origin)
+
+    if browser_res and browser_res.get("html"):
+        raw_bytes = browser_res["html"]
+        if isinstance(raw_bytes, str):
+            raw_bytes = raw_bytes.encode("utf-8", errors="replace")
+        final_url = browser_res.get("final_url") or url
+        cookies = browser_res.get("cookies") or {}
+        _inject_cookies_into_session(sess, cookies, domain=parsed.hostname or "")
+        return final_url, "text/html; charset=utf-8", len(raw_bytes), raw_bytes, "utf-8"
+
     if last_exc:
         raise last_exc
     raise RuntimeError(f"Sayfaya erişilemedi: {url}")
 
 
-def _consume_response(resp) -> tuple:
+def _consume_response(resp, is_stream: bool = False) -> tuple:
     try:
         final_url = str(resp.url)
         content_type = (resp.headers.get("Content-Type") or "").lower()
         content_length = int(resp.headers.get("Content-Length") or 0)
-        encoding = resp.encoding or "utf-8"
+        encoding = getattr(resp, "encoding", None) or "utf-8"
 
         if content_type.startswith(("image/", "video/")) or any(
             urlparse(final_url).path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS
         ):
             return final_url, content_type, content_length, b"", encoding
 
-        if content_type.startswith("text/plain"):
-            raw_bytes = resp.raw.read(2 * 1024 * 1024, decode_content=True)
+        if not is_stream:
+            raw_bytes = resp.content or b""
+            if content_type.startswith("text/plain") and len(raw_bytes) > 2 * 1024 * 1024:
+                raw_bytes = raw_bytes[: 2 * 1024 * 1024]
             return final_url, content_type, content_length, raw_bytes, encoding
 
-        raw_bytes = resp.content
+        max_bytes = 2 * 1024 * 1024 if content_type.startswith("text/plain") else 15 * 1024 * 1024
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_bytes:
+                break
+        raw_bytes = b"".join(chunks) if chunks else (resp.content or b"")
         return final_url, content_type, content_length, raw_bytes, encoding
     finally:
         resp.close()
